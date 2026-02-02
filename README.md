@@ -8,8 +8,6 @@ It is designed for use on macOS and is not compatible with other operating syste
 
 Privacy is never guaranteed. Sensitive data could be sent to the cloud if it is included in the local assistant's responses to Gemini.
 
-![Architecture: Cloud Brain + Local Hands](https://placehold.co/600x200?text=Cloud+Brain+%2B+Local+Hands)
-
 ## 🚀 Why use this?
 *   **Cost:** Offloads heavy processing (like reading long logs) to your local machine.
 *   **Speed:** Local operations may run faster than cloud analysis.
