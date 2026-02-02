@@ -95,6 +95,21 @@ This section outlines upcoming features planned for the Local Assistant, priorit
 | `No local models found in Ollama` | Ollama isn't running or you haven't pulled a model. Run `ollama serve` and `ollama pull <model>`. |
 | `Error reading file...` | The file might not exist, or the sandbox prevented access (you can only access files in the current directory). |
 
+## 🗑️ Uninstall
+
+To completely remove the Local Assistant:
+
+1.  **Unregister from Gemini CLI:**
+    ```bash
+    gemini mcp remove --scope user local-assistant
+    ```
+
+2.  **Delete the installation directory:**
+    (Replace `~/.gemini-local-assistant` if you chose a different path during installation)
+    ```bash
+    rm -rf ~/.gemini-local-assistant
+    ```
+
 ## 📜 License
 MIT
 
