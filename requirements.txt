@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+httpx
+ollama
+python-dotenv
+pypdf
+mcp
