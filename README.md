@@ -67,6 +67,26 @@ This project implements the **"Cloud Brain, Local Hands"** pattern:
     *   It *observes* the output and refines its plan.
 4.  Once finished, it returns the final answer to Gemini.
 
+## ✨ Future Features
+
+This section outlines upcoming features planned for the Local Assistant, prioritizing enhancements for robustness, intelligence, and user experience.
+
+### 1. Technical Robustness: Handling Large Files
+*   **Problem:** Current file reading mechanisms can fail or lose context with very large text files or PDFs, exceeding local model token limits.
+*   **Action:** Implement context chunking and pagination for handling large files. This will include a "summarize-on-load" feature for substantial documents to ensure manageable input for the local agent.
+
+### 2. Local RAG: Semantic Search and Project Indexing
+*   **Problem:** The assistant's current search capabilities are limited to basic text matching (`grep`, `find`), which is inefficient for understanding complex codebases or answering semantic queries.
+*   **Action:** Integrate a local Vector Database (e.g., ChromaDB, FAISS) for project-wide indexing. This will enable a new `semantic_search` tool for the local agent, allowing for more intelligent and context-aware code exploration.
+
+### 3. Privacy-Conscious Web Search
+*   **Problem:** The assistant currently lacks real-time information access from the web, limiting its ability to consult external documentation or current data.
+*   **Action:** Introduce an opt-in `live_search` tool. This feature will allow the local agent to perform web searches (e.g., via Perplexity) without compromising local file privacy by only sending specific queries.
+
+### 4. Dynamic Model Ecosystem
+*   **Problem:** A single, monolithic local model is used for all tasks, which may not be optimal for performance, cost, or specialized capabilities.
+*   **Action:** Implement dynamic model routing. The assistant will be able to select the most appropriate local model based on the task at hand (e.g., a coding-specific model for code generation, a general-purpose model for summarization).
+
 ## 🔧 Troubleshooting
 
 | Error Message | Cause & Fix |
