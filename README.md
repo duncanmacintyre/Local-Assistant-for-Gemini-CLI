@@ -95,6 +95,10 @@ This section outlines upcoming features planned for the Local Assistant, priorit
 *   **Problem:** The agent currently reads files or runs commands one at a time, leading to excessive "thinking" pauses and slow execution for tasks involving multiple files.
 *   **Action:** Update tools like `read_file` to accept lists of arguments (e.g., `filepaths=['a.txt', 'b.txt']`). This allows the agent to gather all necessary context in a single turn, significantly reducing latency.
 
+### 7. Safe Mode (Read-Only)
+*   **Problem:** Even with sandboxing, a powerful agent might accidentally overwrite a file or run a destructive command during complex investigations.
+*   **Action:** Expose a dedicated `ask_local_assistant_readonly` tool. This version will strictly lack `write_file` and `run_shell_command` capabilities, allowing users to perform "pure" analysis and summarization with zero risk of side effects.
+
 ## 🔧 Troubleshooting
 
 | Error Message | Cause & Fix |
