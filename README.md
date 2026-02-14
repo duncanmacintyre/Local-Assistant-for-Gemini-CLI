@@ -87,6 +87,14 @@ This section outlines upcoming features planned for the Local Assistant, priorit
 *   **Problem:** A single, monolithic local model is used for all tasks, which may not be optimal for performance, cost, or specialized capabilities.
 *   **Action:** Implement dynamic model routing. The assistant will be able to select the most appropriate local model based on the task at hand (e.g., a coding-specific model for code generation, a general-purpose model for summarization).
 
+### 5. Interactive Clarification
+*   **Problem:** Currently, if the local agent encounters ambiguity (e.g., "Which file?"), it has to guess or fail because it cannot ask the user for help during execution.
+*   **Action:** Implement a "suspend-and-resume" protocol. The agent will be able to return a question to Gemini, which asks the user, and then resumes the local agent with the user's answer and the previous context preserved.
+
+### 6. Batch Tool Operations
+*   **Problem:** The agent currently reads files or runs commands one at a time, leading to excessive "thinking" pauses and slow execution for tasks involving multiple files.
+*   **Action:** Update tools like `read_file` to accept lists of arguments (e.g., `filepaths=['a.txt', 'b.txt']`). This allows the agent to gather all necessary context in a single turn, significantly reducing latency.
+
 ## 🔧 Troubleshooting
 
 | Error Message | Cause & Fix |
