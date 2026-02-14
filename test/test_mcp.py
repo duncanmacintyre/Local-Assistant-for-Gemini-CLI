@@ -138,9 +138,12 @@ async def test_run_shell_command_error():
 async def test_ask_local_assistant_no_tool(mock_chat):
     """Test assistant when no tool call is needed."""
     from mcp_server import ask_local_assistant
-    mock_chat.return_value = {
-        'message': {'role': 'assistant', 'content': 'direct answer'}
-    }
+    mock_chat.side_effect = [
+        # 1. Main response
+        {'message': {'role': 'assistant', 'content': 'direct answer'}},
+        # 2. Reflection response (status: complete)
+        {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}}
+    ]
     
     result = await ask_local_assistant("What is 2+2?")
     assert result == "direct answer"
@@ -162,18 +165,76 @@ async def test_ask_local_assistant_multiple_turns(mock_chat, tmp_path):
                 'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepath': str(test_file)}}}]
             }
         },
-        {'message': {'role': 'assistant', 'content': 'Done!'}}
+        {'message': {'role': 'assistant', 'content': 'Done!'}},
+        # Reflection step: complete
+        {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}}
     ]
     
     result = await ask_local_assistant("Analyze a.txt")
     
     assert result == "Done!"
-    assert mock_chat.call_count == 2
+    assert mock_chat.call_count == 3  # Tool call + Final Answer + Reflection
     
-    # Verify the last call included the reminder
-    last_call_messages = mock_chat.call_args[1]['messages']
-    assert last_call_messages[-1]['role'] == 'system'
-    assert "REMINDER" in last_call_messages[-1]['content']
+    # Verify the last call included the reminder (on the tool call turn)
+    first_call_messages = mock_chat.call_args_list[0][1]['messages']
+    assert first_call_messages[-1]['role'] == 'system'
+    assert "REMINDER" in first_call_messages[-1]['content']
+
+@pytest.mark.asyncio
+@patch("ollama.chat")
+async def test_ask_local_assistant_reflection_incomplete(mock_chat):
+    """Test that the agent self-corrects when reflection returns incomplete."""
+    from mcp_server import ask_local_assistant
+
+    mock_chat.side_effect = [
+        # 1. First attempt: Claims done, but missed something
+        {'message': {'role': 'assistant', 'content': 'Partial answer.'}},
+        
+        # 2. Reflection: Realizes incomplete
+        {'message': {'role': 'assistant', 'content': '{"status": "incomplete", "reason": "Missed file B"}'}},
+        
+        # 3. Agent reacts to system message injecting the reason -> Calls tool
+        {'message': {
+            'role': 'assistant', 
+            'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepath': 'fileB.txt'}}}]
+        }},
+        
+        # 4. Final Answer
+        {'message': {'role': 'assistant', 'content': 'Complete answer.'}},
+        
+        # 5. Final Reflection: Complete (since has_reflected is true, it might skip or re-check depending on logic)
+        # However, our logic says: "if not has_reflected: ... else: return". 
+        # Wait, the code sets `has_reflected = True` inside the block.
+        # So when it loops back, `has_reflected` is True.
+        # So when `tool_calls` is empty again (step 4), it hits `if not has_reflected` -> False -> Returns immediately.
+        # So we only expect 4 calls!
+    ]
+    
+    # Adjust expectation:
+    # Call 1: "Partial answer" (no tools) -> triggers reflection logic.
+    # Call 2: Reflection prompt -> returns "incomplete". Code appends msg, sets has_reflected=True, continues loop.
+    # Call 3: Loop continues. Agent sees "SELF-CORRECTION..." msg. Calls tool 'read_file'.
+    # Call 4: Loop continues (msg with tool output appended). Agent says "Complete answer".
+    # Call 5 (Check): `tool_calls` empty. `has_reflected` is True. Returns result.
+    # Wait, Call 4 returns "Complete answer" content. The loop checks `if not tool_calls`.
+    # It enters the block. `if not has_reflected` is False.
+    # It returns "Complete answer".
+    # So `mock_chat` is called:
+    # 1. Initial prompt.
+    # 2. Reflection prompt.
+    # 3. Prompt with self-correction msg.
+    # 4. Prompt with tool output.
+    
+    result = await ask_local_assistant("Do full task")
+    
+    assert result == "Complete answer."
+    assert mock_chat.call_count == 4
+    
+    # Verify the self-correction message was injected
+    # The last message is the REMINDER, so we check the one before it
+    third_call_msgs = mock_chat.call_args_list[2][1]['messages']
+    assert "SELF-CORRECTION" in third_call_msgs[-2]['content']
+    assert "Missed file B" in third_call_msgs[-2]['content']
 
 @pytest.mark.asyncio
 @patch("ollama.chat")
@@ -204,7 +265,8 @@ async def test_ask_local_assistant_agent_read_missing(mock_chat):
                 'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepath': 'gone.txt'}}}]
             }
         },
-        {'message': {'content': 'The file is gone.'}}
+        {'message': {'content': 'The file is gone.'}},
+        {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}}
     ]
     
     await ask_local_assistant("Read gone.txt")
@@ -234,12 +296,14 @@ async def test_ask_local_assistant_read_file_partial(mock_chat, tmp_path):
                 }]
             }
         },
-        {'message': {'content': 'Read line 2'}}
+        {'message': {'content': 'Read line 2'}},
+        {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}}
     ]
     
     await ask_local_assistant("Read line 2 of lines.txt")
     
     # Check tool result in history
+    # The history passed to the 2nd call (index 1) contains the tool output
     final_history = mock_chat.call_args_list[1][1]['messages']
     tool_msg = next(m for m in final_history if m['role'] == 'tool')
     assert tool_msg['content'] == "line2\n"
@@ -286,7 +350,10 @@ async def test_list_local_models_error(mock_list):
 async def test_ask_local_assistant_custom_model(mock_chat):
     """Test assistant using a specific model."""
     from mcp_server import ask_local_assistant
-    mock_chat.return_value = {'message': {'content': 'using custom model'}}
+    mock_chat.side_effect = [
+        {'message': {'content': 'using custom model'}},
+        {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}}
+    ]
     await ask_local_assistant("Hello", model="llama3")
-    kwargs = mock_chat.call_args[1]
+    kwargs = mock_chat.call_args_list[0][1]
     assert kwargs['model'] == "llama3"

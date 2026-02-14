@@ -187,6 +187,7 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
 
     MAX_TURNS = 10
     turn_count = 0
+    has_reflected = False
     
     try:
         while turn_count < MAX_TURNS:
@@ -202,7 +203,47 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
             
             tool_calls = assistant_msg.get('tool_calls')
             if not tool_calls:
-                # No more tools requested, model has reached a conclusion
+                # --- REFLECTION STEP ---
+                if not has_reflected:
+                    logger.info("Local Agent: Performing self-reflection check...")
+                    
+                    reflection_prompt = (
+                        f"Self-Correction Check: Review your work. Did you fully answer the user's request: '{prompt}'? "
+                        "If you need to do more work (e.g. read more files, run more commands), answer 'incomplete'. "
+                        "Respond ONLY in JSON format: {\"status\": \"complete\"} OR {\"status\": \"incomplete\", \"reason\": \"<what is missing>\"}."
+                    )
+                    
+                    # Create a temporary message history for the reflection (don't pollute the main history yet)
+                    reflection_messages = messages + [{'role': 'system', 'content': reflection_prompt}]
+                    
+                    try:
+                        # Force JSON mode for the reflection
+                        ref_response = ollama.chat(model=model, messages=reflection_messages, format='json')
+                        ref_content = ref_response.get('message', {}).get('content', '{}')
+                        ref_data = json.loads(ref_content)
+                        
+                        if ref_data.get('status') == 'incomplete':
+                            reason = ref_data.get('reason', 'No reason provided')
+                            logger.info(f"Local Agent Reflection: Incomplete ({reason}). Extending turns.")
+                            
+                            has_reflected = True
+                            MAX_TURNS += 5
+                            
+                            # Inject the realization back into the main history so the agent acts on it
+                            messages.append({
+                                'role': 'system', 
+                                'content': f"SELF-CORRECTION: You acknowledged the task is incomplete because: '{reason}'. "
+                                           f"You have been granted 5 extra turns. Please continue working to resolve this."
+                            })
+                            continue # Resume the loop to allow more tool calls
+                            
+                        else:
+                            logger.info("Local Agent Reflection: Task complete.")
+                            
+                    except Exception as e:
+                        logger.warning(f"Reflection failed (parsing error or model limitation): {e}. Assuming complete.")
+                
+                # No more tools requested and reflection passed (or failed safe)
                 return assistant_msg.get('content', "Task completed.")
 
             for tool_call in tool_calls:

@@ -131,9 +131,10 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
     @patch("ollama.chat")
     async def test_ask_local_assistant_no_tool(self, mock_chat):
         from mcp_server import ask_local_assistant
-        mock_chat.return_value = {
-            'message': {'role': 'assistant', 'content': 'direct answer'}
-        }
+        mock_chat.side_effect = [
+            {'message': {'role': 'assistant', 'content': 'direct answer'}},
+            {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}}
+        ]
         result = await ask_local_assistant("What is 2+2?")
         self.assertEqual(result, "direct answer")
 
@@ -153,15 +154,18 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
                     'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepath': test_file}}}]
                 }
             },
-            {'message': {'role': 'assistant', 'content': 'Done!'}}
+            {'message': {'role': 'assistant', 'content': 'Done!'}},
+            {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}}
         ]
         
         result = await ask_local_assistant("Analyze a.txt")
         
         self.assertEqual(result, "Done!")
-        self.assertEqual(mock_chat.call_count, 2)
+        self.assertEqual(mock_chat.call_count, 3)
         
-        last_call_messages = mock_chat.call_args[1]['messages']
+        # Verify the tool call included the reminder
+        # call_args_list[0] is the first call (tool request)
+        last_call_messages = mock_chat.call_args_list[0][1]['messages']
         self.assertEqual(last_call_messages[-1]['role'], 'system')
         self.assertIn("REMINDER", last_call_messages[-1]['content'])
 
@@ -190,7 +194,8 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
                     'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepath': 'gone.txt'}}}]
                 }
             },
-            {'message': {'content': 'The file is gone.'}}
+            {'message': {'content': 'The file is gone.'}},
+            {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}}
         ]
         
         await ask_local_assistant("Read gone.txt")
@@ -223,7 +228,8 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
                     }]
                 }
             },
-            {'message': {'content': 'Read line 2'}}
+            {'message': {'content': 'Read line 2'}},
+            {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}}
         ]
         
         await ask_local_assistant("Read line 2 of lines.txt")
@@ -266,9 +272,12 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
     @patch("ollama.chat")
     async def test_ask_local_assistant_custom_model(self, mock_chat):
         from mcp_server import ask_local_assistant
-        mock_chat.return_value = {'message': {'content': 'using custom model'}}
+        mock_chat.side_effect = [
+            {'message': {'content': 'using custom model'}},
+            {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}}
+        ]
         await ask_local_assistant("Hello", model="llama3")
-        kwargs = mock_chat.call_args[1]
+        kwargs = mock_chat.call_args_list[0][1]
         self.assertEqual(kwargs['model'], "llama3")
 
 if __name__ == "__main__":
