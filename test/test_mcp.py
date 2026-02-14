@@ -44,18 +44,36 @@ def test_read_local_file_text(tmp_path):
     from mcp_server import _read_local_file as read_fn
     assert read_fn(str(test_file)) == "hello world"
 
-@patch("mcp_server.PdfReader")
-def test_read_local_file_pdf(mock_pdf_reader, tmp_path):
-    """Test reading a PDF file (mocked)."""
-    test_pdf = tmp_path / "test.pdf"
-    test_pdf.write_text("pdf-like-content")
-    
-    mock_page = MagicMock()
-    mock_page.extract_text.return_value = "extracted pdf text"
-    mock_pdf_reader.return_value.pages = [mock_page]
+def test_read_local_file_text_partial(tmp_path):
+    """Test reading a text file with offset and limit."""
+    test_file = tmp_path / "lines.txt"
+    test_file.write_text("line1\nline2\nline3\nline4\n", encoding="utf-8")
     
     from mcp_server import _read_local_file as read_fn
-    assert "extracted pdf text" in read_fn(str(test_pdf))
+    # Test offset only
+    assert read_fn(str(test_file), offset=2) == "line3\nline4\n"
+    # Test offset and limit
+    assert read_fn(str(test_file), offset=1, limit=2) == "line2\nline3\n"
+
+@patch("mcp_server.PdfReader")
+def test_read_local_file_pdf_partial(mock_pdf_reader, tmp_path):
+    """Test reading specific pages of a PDF."""
+    test_pdf = tmp_path / "test.pdf"
+    test_pdf.write_text("pdf-content")
+    
+    p1 = MagicMock()
+    p1.extract_text.return_value = "page 1 text"
+    p2 = MagicMock()
+    p2.extract_text.return_value = "page 2 text"
+    
+    mock_pdf_reader.return_value.pages = [p1, p2]
+    
+    from mcp_server import _read_local_file as read_fn
+    # Test reading only page 2
+    result = read_fn(str(test_pdf), pages=[2])
+    assert "page 2 text" in result
+    assert "page 1 text" not in result
+    assert "--- Page 2 ---" in result
 
 def test_read_local_file_not_found():
     """Verify error message for non-existent files."""
@@ -140,12 +158,7 @@ async def test_ask_local_assistant_multiple_turns(mock_chat, tmp_path):
         {
             'message': {
                 'role': 'assistant',
-                'tool_calls': [{'function': {'name': 'log_thought', 'arguments': {'thought': 'Planning'}}}]
-            }
-        },
-        {
-            'message': {
-                'role': 'assistant',
+                'content': 'Thinking about reading...',
                 'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepath': str(test_file)}}}]
             }
         },
@@ -155,7 +168,12 @@ async def test_ask_local_assistant_multiple_turns(mock_chat, tmp_path):
     result = await ask_local_assistant("Analyze a.txt")
     
     assert result == "Done!"
-    assert mock_chat.call_count == 3
+    assert mock_chat.call_count == 2
+    
+    # Verify the last call included the reminder
+    last_call_messages = mock_chat.call_args[1]['messages']
+    assert last_call_messages[-1]['role'] == 'system'
+    assert "REMINDER" in last_call_messages[-1]['content']
 
 @pytest.mark.asyncio
 @patch("ollama.chat")
@@ -165,7 +183,7 @@ async def test_ask_local_assistant_turn_limit(mock_chat):
     mock_chat.return_value = {
         'message': {
             'role': 'assistant',
-            'tool_calls': [{'function': {'name': 'log_thought', 'arguments': {'thought': 'Looping'}}}]
+            'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepath': 'dummy'}}}]
         }
     }
     
@@ -194,6 +212,37 @@ async def test_ask_local_assistant_agent_read_missing(mock_chat):
     final_history = mock_chat.call_args_list[1][1]['messages']
     tool_msg = next(m for m in final_history if m['role'] == 'tool')
     assert "not found" in tool_msg['content']
+
+@pytest.mark.asyncio
+@patch("ollama.chat")
+async def test_ask_local_assistant_read_file_partial(mock_chat, tmp_path):
+    """Verify that the agent can call read_file with offset/limit/pages."""
+    from mcp_server import ask_local_assistant
+    
+    test_file = tmp_path / "lines.txt"
+    test_file.write_text("line1\nline2\nline3\n", encoding="utf-8")
+    
+    mock_chat.side_effect = [
+        {
+            'message': {
+                'role': 'assistant',
+                'tool_calls': [{
+                    'function': {
+                        'name': 'read_file', 
+                        'arguments': {'filepath': str(test_file), 'offset': 1, 'limit': 1}
+                    }
+                }]
+            }
+        },
+        {'message': {'content': 'Read line 2'}}
+    ]
+    
+    await ask_local_assistant("Read line 2 of lines.txt")
+    
+    # Check tool result in history
+    final_history = mock_chat.call_args_list[1][1]['messages']
+    tool_msg = next(m for m in final_history if m['role'] == 'tool')
+    assert tool_msg['content'] == "line2\n"
 
 # --- Model & Ollama Tool Tests ---
 

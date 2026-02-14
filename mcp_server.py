@@ -5,6 +5,7 @@ import subprocess
 import ctypes
 import sys
 import ollama
+from itertools import islice
 from pypdf import PdfReader
 from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
@@ -33,24 +34,36 @@ def is_sandboxed() -> bool:
     except Exception:
         return False
 
-def _read_local_file(filepath: str) -> str:
-    """Helper to read text or PDF files locally."""
+def _read_local_file(filepath: str, offset: int = 0, limit: int = None, pages: list[int] = None) -> str:
+    """Helper to read text or PDF files locally with support for partial reading."""
     if not os.path.exists(filepath):
         return f"[Error: File {filepath} not found]"
 
     if filepath.lower().endswith(".pdf"):
         try:
             reader = PdfReader(filepath)
+            total_pages = len(reader.pages)
             text = ""
-            for page in reader.pages:
-                text += page.extract_text() + "\n"
+            
+            # If pages are specified, use them (1-indexed for user convenience)
+            target_pages = pages if pages else range(1, total_pages + 1)
+            
+            for p_num in target_pages:
+                if 1 <= p_num <= total_pages:
+                    text += f"--- Page {p_num} ---\n"
+                    text += reader.pages[p_num - 1].extract_text() + "\n"
+                else:
+                    text += f"[Warning: Page {p_num} out of range (Total pages: {total_pages})]\n"
             return text
         except Exception as e:
             return f"[Error reading PDF {filepath}: {str(e)}]"
     else:
         try:
             with open(filepath, "r", encoding="utf-8") as f:
-                return f.read()
+                # Use offset/limit for text files (lines) efficiently with islice
+                stop = (offset + limit) if limit else None
+                gen = islice(f, offset, stop)
+                return "".join(gen)
         except Exception as e:
             return f"[Error reading file {filepath}: {str(e)}]"
 
@@ -88,26 +101,30 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
         "You act as the local 'hands' for a Cloud-based Brain (Gemini). You process sensitive data "
         "locally to ensure privacy. You have access to the current project directory.\n\n"
         
+        "PRIORITY 1: PRECISION & ADHERENCE\n"
+        "Always prioritize the user's specific request. If the user asks for extraction (e.g., 'Who are the authors?'), "
+        "provide ONLY that information. Do NOT provide high-level summaries unless explicitly asked.\n\n"
+
         "OPERATING MODE:\n"
         "You MUST solve tasks iteratively using a 'Think-Act-Observe' cycle:\n"
-        "1. THOUGHT: Explain your reasoning, analyze observations, and plan your next move.\n"
-        "2. ACTION: Call exactly ONE tool to execute a step of your plan.\n"
+        "1. THOUGHT: First, explain your reasoning and plan in the text response.\n"
+        "2. ACTION: Then, call exactly ONE tool to execute a step of your plan.\n"
         "3. OBSERVATION: Review the tool's output. If it failed, diagnose why and try a different approach.\n\n"
         
         "CAPABILITIES & TOOLS:\n"
-        "- 'log_thought': Record your internal planning or complex reasoning. Use this before every action.\n"
         "- 'run_shell_command': Run zsh commands. You have access to standard macOS utilities: grep, rg, sed, awk, find, ls, cat, etc.\n"
         "  * Use 'rg' (ripgrep) for high-performance text searching.\n"
         "  * Use 'awk' or 'column' for processing structured/tabular text.\n"
         "- 'read_file': Read text OR PDF files. PDFs are automatically converted to text for you.\n"
+        "  * Use 'offset' and 'limit' (lines) for text files to avoid context overload.\n"
+        "  * Use 'pages' (list of ints) for PDFs. For metadata like authors/titles, usually only Page 1 is needed.\n"
         "- 'write_file': Save results or summaries to a file.\n\n"
         
         "CONSTRAINTS:\n"
         "- Stay focused on the task.\n"
         "- If you are stuck after several attempts, report the specific technical blocker.\n"
-        "- When finished, you must give a concise summary of what you found and what you did. "
-        "Assess whether you completed all of the instructions. Include full paths of all files that you modified. "
-        "Anonymize any sensitive or personal information when giving your summary.\n\n"
+        "- When finished, provide the specific answer requested.\n"
+        "- Anonymize PII (Personally Identifiable Information) in your final response unless the user explicitly requested that specific data.\n\n"
     )
     
     messages = [{'role': 'system', 'content': system_msg}, {'role': 'user', 'content': prompt}]
@@ -119,26 +136,19 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
         {
             'type': 'function',
             'function': {
-                'name': 'log_thought',
-                'description': 'Record your reasoning, plan, or analysis.',
-                'parameters': {
-                    'type': 'object',
-                    'properties': {
-                        'thought': {'type': 'string', 'description': 'Your internal reasoning.'},
-                    },
-                    'required': ['thought'],
-                },
-            },
-        },
-        {
-            'type': 'function',
-            'function': {
                 'name': 'read_file',
                 'description': 'Read content from a file.',
                 'parameters': {
                     'type': 'object',
                     'properties': {
                         'filepath': {'type': 'string', 'description': 'Path to the file to read.'},
+                        'offset': {'type': 'integer', 'description': 'Line number to start reading from (text files).'},
+                        'limit': {'type': 'integer', 'description': 'Number of lines to read (text files).'},
+                        'pages': {
+                            'type': 'array', 
+                            'items': {'type': 'integer'}, 
+                            'description': 'List of page numbers to read (PDF files, 1-indexed).'
+                        },
                     },
                     'required': ['filepath'],
                 },
@@ -183,7 +193,10 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
             turn_count += 1
             logger.info(f"Local Agent Loop: Turn {turn_count}/{MAX_TURNS}")
             
-            response = ollama.chat(model=model, messages=messages, tools=tools)
+            # Inject a transient reminder of the original goal to prevent context drift
+            current_messages = messages + [{'role': 'system', 'content': f"REMINDER: Your primary goal is: {prompt}. Focus on this task."}]
+            
+            response = ollama.chat(model=model, messages=current_messages, tools=tools)
             assistant_msg = response.get('message', {})
             messages.append(assistant_msg)
             
@@ -203,12 +216,13 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
                         args = {}
                 
                 result = ""
-                if func_name == "log_thought":
-                    thought = args.get('thought', "")
-                    logger.info(f"Local Agent Thought: {thought}")
-                    result = "Thought recorded."
-                elif func_name == "read_file":
-                    result = _read_local_file(args.get('filepath', ""))
+                if func_name == "read_file":
+                    result = _read_local_file(
+                        args.get('filepath', ""),
+                        offset=args.get('offset', 0),
+                        limit=args.get('limit'),
+                        pages=args.get('pages')
+                    )
                 elif func_name == "write_file":
                     fp = args.get('filepath', "")
                     try:
@@ -273,17 +287,22 @@ async def write_file(filepath: str, content: str) -> str:
         return f"Error writing file: {str(e)}"
 
 @mcp.tool()
-async def read_file(filepath: str) -> str:
+async def read_file(filepath: str, offset: int = 0, limit: int = None, pages: list[int] = None) -> str:
     """
     Reads content from a file.
+    
+    Args:
+        filepath: Path to the file.
+        offset: Line number to start reading from (for text files).
+        limit: Number of lines to read (for text files).
+        pages: List of page numbers to read (for PDF files, 1-indexed).
     """
-    logger.info(f"Reading from {filepath}")
+    logger.info(f"Reading from {filepath} (offset={offset}, limit={limit}, pages={pages})")
     if not os.path.exists(filepath):
         return f"Error: File '{filepath}' not found."
         
     try:
-        # Reuse helper for consistent PDF/Text handling
-        return _read_local_file(filepath)
+        return _read_local_file(filepath, offset=offset, limit=limit, pages=pages)
     except Exception as e:
         logger.error(f"File Read Error: {e}")
         return f"Error reading file: {str(e)}"
