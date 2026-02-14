@@ -23,6 +23,7 @@ mcp = FastMCP("Local Assistant for Gemini CLI")
 # Configuration
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 LOCAL_WORKER_MODEL = os.getenv("LOCAL_WORKER_MODEL", "qwen3-coder:30b")
+PLAN_FILE = ".gemini/local_plan.md"
 
 def is_sandboxed() -> bool:
     """Checks if the process is running within a macOS sandbox (seatbelt)."""
@@ -50,7 +51,9 @@ def _read_local_file(filepath: str, offset: int = 0, limit: int = None, pages: l
             
             for p_num in target_pages:
                 if 1 <= p_num <= total_pages:
-                    text += f"--- Page {p_num} ---\n"
+                    # Show header if specifically requested pages OR if multi-page document
+                    if pages or total_pages > 1:
+                        text += f"--- Page {p_num} ---\n"
                     text += reader.pages[p_num - 1].extract_text() + "\n"
                 else:
                     text += f"[Warning: Page {p_num} out of range (Total pages: {total_pages})]\n"
@@ -74,7 +77,14 @@ async def list_local_models() -> str:
     """
     try:
         models_info = ollama.list()
-        models = [m['name'] for m in models_info.get('models', [])]
+        # The ollama library returns a ModelList object with a list of Model objects
+        # Each Model object has a 'model' attribute for its name.
+        models = []
+        if hasattr(models_info, 'models'):
+            models = [m.model for m in models_info.models]
+        elif isinstance(models_info, dict) and 'models' in models_info:
+            models = [m.get('name') or m.get('model') for m in models_info['models']]
+            
         if not models:
             return "No local models found in Ollama."
         return "Available local models:\n- " + "\n- ".join(models)
@@ -83,55 +93,61 @@ async def list_local_models() -> str:
         return f"Error listing models: {str(e)}"
 
 @mcp.tool()
-async def ask_local_assistant(prompt: str, local_file_context: list[str] = None, model: str = LOCAL_WORKER_MODEL) -> str:
+async def complete_plan_step(step_index: int) -> str:
+    """
+    Marks a specific step in the local execution plan as completed.
+    
+    Args:
+        step_index: The 1-based index of the step to mark as complete (e.g., 1 for the first step).
+    """
+    if not os.path.exists(PLAN_FILE):
+        return f"Error: Plan file {PLAN_FILE} not found. Are you in Planning Mode?"
+        
+    try:
+        with open(PLAN_FILE, "r") as f:
+            lines = f.readlines()
+            
+        count = 0
+        updated = False
+        for i, line in enumerate(lines):
+            # Matches "- [ ]" or "- [x]"
+            if "- [" in line and ("] " in line):
+                count += 1
+                if count == step_index:
+                    if "- [ ]" in line:
+                        lines[i] = line.replace("- [ ]", "- [x]")
+                        updated = True
+                    else:
+                        return f"Step {step_index} is already marked as complete."
+                    break
+        
+        if not updated:
+            return f"Error: Could not find step {step_index} in the plan."
+            
+        with open(PLAN_FILE, "w") as f:
+            f.writelines(lines)
+            
+        return f"Successfully marked step {step_index} as complete in {PLAN_FILE}."
+    except Exception as e:
+        logger.error(f"Error updating plan: {e}")
+        return f"Error updating plan: {str(e)}"
+
+@mcp.tool()
+async def ask_local_assistant(prompt: str, local_file_context: list[str] = None, model: str = LOCAL_WORKER_MODEL, use_plan: bool = False) -> str:
     """
     PRIMARY DIRECTIVE: Use this for tasks involving PRIVACY, LOCAL FILES, or complex multi-step processing.
     
-    This tool runs a LOCAL AGENT with an iterative reasoning loop. It can:
-    - Think and Plan step-by-step.
-    - Read/write files in the current working directory.
-    - Execute shell commands (grep, awk, sed, find, etc.).
-    - Self-correct based on command output.
+    Args:
+        prompt: The task description.
+        local_file_context: Optional list of files to provide as context.
+        model: The local model to use (default: qwen3-coder:30b).
+        use_plan: IMPORTANT: Set to True if the task is complex, requires multiple steps (e.g. refactoring, debugging), or modifies files.
+                  When True, the agent will create a plan and execute it step-by-step. The final response will include a detailed execution checklist for verification.
+                  Default is False (for simple queries).
     """
-    logger.info(f"Local Agent: Initializing iterative loop with model {model}")
+    logger.info(f"Local Agent: Initializing iterative loop with model {model} (Planning Mode: {use_plan})")
     
-    system_msg = (
-        "IDENTITY & CONTEXT:\n"
-        "You are the 'Local Assistant', a secure autonomous reasoning agent running on the user's computer. "
-        "You act as the local 'hands' for a Cloud-based Brain (Gemini). You process sensitive data "
-        "locally to ensure privacy. You have access to the current project directory.\n\n"
-        
-        "PRIORITY 1: PRECISION & ADHERENCE\n"
-        "Always prioritize the user's specific request. If the user asks for extraction (e.g., 'Who are the authors?'), "
-        "provide ONLY that information. Do NOT provide high-level summaries unless explicitly asked.\n\n"
-
-        "OPERATING MODE:\n"
-        "You MUST solve tasks iteratively using a 'Think-Act-Observe' cycle:\n"
-        "1. THOUGHT: First, explain your reasoning and plan in the text response.\n"
-        "2. ACTION: Then, call exactly ONE tool to execute a step of your plan.\n"
-        "3. OBSERVATION: Review the tool's output. If it failed, diagnose why and try a different approach.\n\n"
-        
-        "CAPABILITIES & TOOLS:\n"
-        "- 'run_shell_command': Run zsh commands. You have access to standard macOS utilities: grep, rg, sed, awk, find, ls, cat, etc.\n"
-        "  * Use 'rg' (ripgrep) for high-performance text searching.\n"
-        "  * Use 'awk' or 'column' for processing structured/tabular text.\n"
-        "- 'read_file': Read text OR PDF files. PDFs are automatically converted to text for you.\n"
-        "  * Use 'offset' and 'limit' (lines) for text files to avoid context overload.\n"
-        "  * Use 'pages' (list of ints) for PDFs. For metadata like authors/titles, usually only Page 1 is needed.\n"
-        "- 'write_file': Save results or summaries to a file.\n\n"
-        
-        "CONSTRAINTS:\n"
-        "- Stay focused on the task.\n"
-        "- If you are stuck after several attempts, report the specific technical blocker.\n"
-        "- When finished, provide the specific answer requested.\n"
-        "- Anonymize PII (Personally Identifiable Information) in your final response unless the user explicitly requested that specific data.\n\n"
-    )
-    
-    messages = [{'role': 'system', 'content': system_msg}, {'role': 'user', 'content': prompt}]
-    if local_file_context:
-        ctx_msg = f"Available files: {', '.join(local_file_context)}."
-        messages.insert(1, {'role': 'system', 'content': ctx_msg})
-
+    # Define available tools
     tools = [
         {
             'type': 'function',
@@ -172,6 +188,20 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
         {
             'type': 'function',
             'function': {
+                'name': 'complete_plan_step',
+                'description': 'Mark a step in the execution plan as completed.',
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'step_index': {'type': 'integer', 'description': 'The 1-based index of the step to mark as complete.'},
+                    },
+                    'required': ['step_index'],
+                },
+            },
+        },
+        {
+            'type': 'function',
+            'function': {
                 'name': 'run_shell_command',
                 'description': 'Execute a shell command (zsh).',
                 'parameters': {
@@ -185,17 +215,186 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
         },
     ]
 
-    MAX_TURNS = 10
+    async def execute_tool(func_name, args):
+        if func_name == "read_file":
+            return _read_local_file(
+                args.get('filepath', ""),
+                offset=args.get('offset', 0),
+                limit=args.get('limit'),
+                pages=args.get('pages')
+            )
+        elif func_name == "write_file":
+            fp = args.get('filepath', "")
+            try:
+                if os.path.dirname(fp):
+                    os.makedirs(os.path.dirname(fp), exist_ok=True)
+                with open(fp, "w") as f:
+                    f.write(args.get('content', ""))
+                return f"Successfully wrote to {fp}"
+            except Exception as e:
+                return f"Error writing file: {str(e)}"
+        elif func_name == "complete_plan_step":
+            return await complete_plan_step(args.get('step_index', 0))
+        elif func_name == "run_shell_command":
+            return await run_shell_command(args.get('command', ""))
+        return f"Unknown tool: {func_name}"
+
+    # --- PHASE 1: FORCED PLANNING (If enabled) ---
+    if use_plan:
+        logger.info("Local Agent: Entering Planning Phase...")
+        
+        # 1. Clear old plan
+        if os.path.exists(PLAN_FILE):
+            os.remove(PLAN_FILE)
+            
+        # 2. Planning Loop
+        plan_system_msg = (
+            "You are a Senior Technical Planner. Your goal is to create a detailed, step-by-step implementation plan "
+            "for the user's request. To create a grounded and accurate plan, you should first explore the project "
+            "using 'run_shell_command' (e.g., 'ls -R', 'grep') and 'read_file'.\n\n"
+            f"Once you understand the context, you MUST call the 'write_file' tool to save your plan to the EXACT path: '{PLAN_FILE}'.\n"
+            "Format your plan as a Markdown checklist:\n"
+            "- [ ] Step 1: <Description>\n"
+            "- [ ] Step 2: <Description>\n\n"
+            "Do NOT execute implementation steps yet. Only use discovery tools to inform your plan. "
+            "After writing the plan file, stop."
+        )
+        
+        plan_messages = [{'role': 'system', 'content': plan_system_msg}, {'role': 'user', 'content': prompt}]
+        
+        plan_created = False
+        attempted_paths = []
+        planning_tools = [t for t in tools if t['function']['name'] in ['write_file', 'read_file', 'run_shell_command']]
+
+        for i in range(10): # Max 10 turns to explore + write a plan
+            logger.info(f"Planning Turn {i+1}/10")
+            response = ollama.chat(model=model, messages=plan_messages, tools=planning_tools)
+            msg = response.get('message', {})
+            logger.info(f"Planning Response: {msg}")
+            plan_messages.append(msg)
+            
+            tool_calls = msg.get('tool_calls')
+            if not tool_calls:
+                if plan_created:
+                    break
+                else:
+                    plan_messages.append({'role': 'system', 'content': f"You must write the plan to '{PLAN_FILE}' using 'write_file' before finishing."})
+                    continue
+
+            for tc in tool_calls:
+                func_name = tc['function']['name']
+                args = json.loads(tc['function']['arguments']) if isinstance(tc['function']['arguments'], str) else tc['function']['arguments']
+                
+                result = await execute_tool(func_name, args)
+                plan_messages.append({'role': 'tool', 'content': result, 'name': func_name})
+                
+                if func_name == "write_file":
+                    fp = args.get('filepath', "")
+                    attempted_paths.append(fp)
+                    if fp.endswith("local_plan.md"):
+                        plan_created = True
+            
+            if plan_created and not any(tc['function']['name'] != 'write_file' for tc in tool_calls):
+                 # If we just wrote the plan and didn't do anything else, we might be done
+                 pass 
+
+        if not plan_created:
+            return f"Error: Agent failed to generate a plan file ({PLAN_FILE}) in Planning Mode. Attempted paths: {attempted_paths}"
+        
+        logger.info("Local Agent: Plan created. Entering Execution Phase.")
+
+    # --- PHASE 2: EXECUTION LOOP (Main) ---
+    
+    base_system_msg = (
+        "IDENTITY & CONTEXT:\n"
+        "You are the 'Local Assistant', a secure autonomous reasoning agent running on the user's computer. "
+        "You act as the local 'hands' for a Cloud-based Brain (Gemini). You process sensitive data "
+        "locally to ensure privacy. You have access to the current project directory.\n\n"
+        
+        "PRIORITY 1: PRECISION & ADHERENCE\n"
+        "Always prioritize the user's specific request. If the user asks for extraction (e.g., 'Who are the authors?'), "
+        "provide ONLY that information. Do NOT provide high-level summaries unless explicitly asked.\n\n"
+
+        "CAPABILITIES & TOOLS:\n"
+        "- 'run_shell_command': Run zsh commands. You have access to standard macOS utilities: grep, rg, sed, awk, find, ls, cat, etc.\n"
+        "  * Use 'rg' (ripgrep) for high-performance text searching.\n"
+        "  * Use 'awk' or 'column' for processing structured/tabular text.\n"
+        "- 'read_file': Read text OR PDF files. PDFs are automatically converted to text for you.\n"
+        "  * Use 'offset' and 'limit' (lines) for text files to avoid context overload.\n"
+        "  * Use 'pages' (list of ints) for PDFs. For metadata like authors/titles, usually only Page 1 is needed.\n"
+        "- 'write_file': Save results or summaries to a file.\n\n"
+        
+        "CONSTRAINTS:\n"
+        "- Stay focused on the task.\n"
+        "- If you are stuck after several attempts, report the specific technical blocker.\n"
+        "- When finished, provide the specific answer requested.\n"
+        "- Anonymize PII (Personally Identifiable Information) in your final response unless the user explicitly requested that specific data.\n\n"
+    )
+
+    if use_plan:
+        execution_instructions = (
+            "OPERATING MODE: PLAN EXECUTION\n"
+            "You are executing a pre-defined plan. The current plan status will be provided to you every turn.\n"
+            "YOUR JOB:\n"
+            "1. Review the 'CURRENT PLAN STATE'.\n"
+            "2. Execute the next unchecked step ([ ]).\n"
+            "3. VERY IMPORTANT: After finishing the work for a step, you MUST call 'complete_plan_step' to mark it as [x].\n"
+            "   - You MUST pass the 1-based index of the step you just completed.\n"
+            "   - Do NOT try to edit the plan file manually using 'write_file'. Use 'complete_plan_step'.\n"
+            "4. Do not deviate from the plan."
+        )
+        system_msg = base_system_msg + execution_instructions
+    else:
+        system_msg = base_system_msg + (
+            "OPERATING MODE: DIRECT EXECUTION\n"
+            "You MUST solve tasks iteratively using a 'Think-Act-Observe' cycle:\n"
+            "1. THOUGHT: First, explain your reasoning and plan in the text response.\n"
+            "2. ACTION: Then, call exactly ONE tool to execute a step of your plan.\n"
+            "3. OBSERVATION: Review the tool's output. If it failed, diagnose why and try a different approach.\n\n"
+        )
+    
+    messages = [{'role': 'system', 'content': system_msg}, {'role': 'user', 'content': prompt}]
+    if local_file_context:
+        ctx_msg = f"Available files: {', '.join(local_file_context)}."
+        messages.insert(1, {'role': 'system', 'content': ctx_msg})
+
+    # Increase turns for planning mode as it involves overhead steps (update plan)
+    MAX_TURNS = 30 if use_plan else 15
     turn_count = 0
     has_reflected = False
+    plan_nudge_count = 0
+    last_tool_was_work = False
     
     try:
         while turn_count < MAX_TURNS:
             turn_count += 1
+            remaining = MAX_TURNS - turn_count
             logger.info(f"Local Agent Loop: Turn {turn_count}/{MAX_TURNS}")
             
-            # Inject a transient reminder of the original goal to prevent context drift
-            current_messages = messages + [{'role': 'system', 'content': f"REMINDER: Your primary goal is: {prompt}. Focus on this task."}]
+            # --- CONTEXT INJECTION (The "Python-Led" Logic) ---
+            loop_system_msg = f"REMINDER: {prompt}\n"
+            loop_system_msg += f"PROGRESS: Turn {turn_count}/{MAX_TURNS} ({remaining} remaining).\n"
+            
+            if use_plan and os.path.exists(PLAN_FILE):
+                try:
+                    with open(PLAN_FILE, 'r') as f:
+                        plan_content = f.read()
+                    loop_system_msg += f"\n=== CURRENT PLAN STATE ({PLAN_FILE}) ===\n{plan_content}\n===============================\n"
+                    
+                    if last_tool_was_work:
+                        loop_system_msg += "The previous action appeared successful. If a plan step is now complete, you should update the plan using 'complete_plan_step' before proceeding.\n"
+                    else:
+                        loop_system_msg += "INSTRUCTION: Execute the next [ ] step. Then call 'complete_plan_step' with the correct index to mark it [x].\n"
+
+                    # Detect if plan is fully complete to nudge finishing
+                    if "- [ ]" not in plan_content and "- [x]" in plan_content:
+                        loop_system_msg += "Plan appears complete. You can now provide your final response.\n"
+                except Exception as e:
+                    loop_system_msg += f"\n[Warning: Could not read plan file: {e}]\n"
+            else:
+                loop_system_msg += " Focus on this task.\n"
+            
+            current_messages = messages + [{'role': 'system', 'content': loop_system_msg}]
             
             response = ollama.chat(model=model, messages=current_messages, tools=tools)
             assistant_msg = response.get('message', {})
@@ -239,16 +438,67 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
                             
                         else:
                             logger.info("Local Agent Reflection: Task complete.")
+                            has_reflected = True
                             
                     except Exception as e:
                         logger.warning(f"Reflection failed (parsing error or model limitation): {e}. Assuming complete.")
                 
-                # No more tools requested and reflection passed (or failed safe)
-                return assistant_msg.get('content', "Task completed.")
+                # --- PLAN VALIDATION NUDGE ---
+                if use_plan and os.path.exists(PLAN_FILE):
+                    try:
+                        with open(PLAN_FILE, 'r') as f:
+                            plan_content = f.read()
+                        if "- [ ]" in plan_content and plan_nudge_count < 2:
+                            plan_nudge_count += 1
+                            logger.info(f"Local Agent: Intercepting finish. {plan_content.count('- [ ]')} steps still unchecked. Nudging...")
+                            messages.append({
+                                'role': 'system', 
+                                'content': "You have attempted to finish, but some steps in the plan are still marked as incomplete [ ]. "
+                                           "If these steps are finished, please update the plan using 'complete_plan_step'. "
+                                           "If they are not needed or you have a reason to skip them, please explain. "
+                                           "Otherwise, continue with the remaining work."
+                            })
+                            continue # Re-run the loop for another turn
+                    except Exception as e:
+                        logger.warning(f"Plan validation failed: {e}")
+
+                # No more tools requested and reflection/plan checks passed
+                final_response = assistant_msg.get('content', "Task completed.")
+                
+                if use_plan and os.path.exists(PLAN_FILE):
+                    try:
+                        with open(PLAN_FILE, 'r') as f:
+                            plan_content = f.read()
+                        
+                        # Check if plan was actually updated (basic check for [x])
+                        if "- [x]" not in plan_content and "- [ ]" in plan_content:
+                             final_response += "\n\n[Warning: Agent executed actions but failed to update the plan checklist.]"
+                        
+                        final_response += f"\n\n--- EXECUTION PLAN ---\n{plan_content}\n----------------------"
+                        
+                        # Cleanup
+                        if os.path.exists(PLAN_FILE):
+                            os.remove(PLAN_FILE)
+                        # Try to remove the directory if empty
+                        try:
+                            os.rmdir(os.path.dirname(PLAN_FILE))
+                        except (OSError, FileNotFoundError):
+                            pass # Directory not empty or already gone
+                            
+                    except Exception as e:
+                        logger.warning(f"Could not read/cleanup plan file: {e}")
+                
+                return final_response
 
             for tool_call in tool_calls:
                 func_name = tool_call['function']['name']
                 args = tool_call['function'].get('arguments', {})
+                
+                # Track if this turn involved actual work vs just bureaucracy
+                if func_name in ["run_shell_command", "write_file"]:
+                    last_tool_was_work = True
+                else:
+                    last_tool_was_work = False
                 
                 if not isinstance(args, dict):
                     try:
@@ -256,33 +506,15 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
                     except:
                         args = {}
                 
-                result = ""
-                if func_name == "read_file":
-                    result = _read_local_file(
-                        args.get('filepath', ""),
-                        offset=args.get('offset', 0),
-                        limit=args.get('limit'),
-                        pages=args.get('pages')
-                    )
-                elif func_name == "write_file":
-                    fp = args.get('filepath', "")
-                    try:
-                        if os.path.dirname(fp):
-                            os.makedirs(os.path.dirname(fp), exist_ok=True)
-                        with open(fp, "w") as f:
-                            f.write(args.get('content', ""))
-                        result = f"Successfully wrote to {fp}"
-                    except Exception as e:
-                        result = f"Error writing file: {str(e)}"
-                elif func_name == "run_shell_command":
-                    result = await run_shell_command(args.get('command', ""))
-                
+                result = await execute_tool(func_name, args)
                 messages.append({'role': 'tool', 'content': result, 'name': func_name})
         
-        return "Local Agent reached the maximum turn limit (10) without finishing the task."
+        return f"Local Agent reached the maximum turn limit ({MAX_TURNS}) without finishing the task."
         
     except Exception as e:
-        logger.error(f"Local Agent Error: {e}")
+        import traceback
+        error_trace = traceback.format_exc()
+        logger.error(f"Local Agent Error: {e}\n{error_trace}")
         return f"Error in local agent: {str(e)}"
 
 @mcp.tool()

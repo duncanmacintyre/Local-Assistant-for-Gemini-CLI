@@ -55,6 +55,15 @@ gemini -s "Ask the local assistant to find where 'API_KEY' is used in this folde
 gemini -s "Tell the local assistant to better organize the functions in 'utils.py'."
 ```
 
+### Example 4: Deep Work (Planning Mode)
+For complex tasks (e.g., "Refactor the entire module" or "Investigate this bug across 5 files"), the assistant can enter **Planning Mode**.
+*   **Phase 1:** It creates a checklist in `.gemini/local_plan.md`.
+*   **Phase 2:** It executes the plan step-by-step, updating the checklist as it goes.
+*   *Trigger:* This mode is automatically selected by Gemini when you ask for "complex" or "multi-step" tasks, or you can explicitly ask:
+    ```bash
+    gemini -s "Use the local assistant in planning mode to refactor the test suite."
+    ```
+
 ## 🏗️ Architecture
 
 This project implements the **"Cloud Brain, Local Hands"** pattern:

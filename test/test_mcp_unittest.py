@@ -3,7 +3,8 @@ import os
 import shutil
 import tempfile
 import sys
-from unittest.mock import MagicMock, patch
+import json
+from unittest.mock import MagicMock, patch, mock_open
 import mcp_server
 
 class TestMCPServer(unittest.IsolatedAsyncioTestCase):
@@ -129,6 +130,100 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
     # --- Agent Loop Logic (Mocked Ollama) ---
 
     @patch("ollama.chat")
+    async def test_ask_local_assistant_planning_mode(self, mock_chat):
+        from mcp_server import ask_local_assistant
+        
+        mock_chat.side_effect = [
+            # Phase 1: Planning Turn 1 (Write Plan)
+            {
+                'message': {
+                    'role': 'assistant',
+                    'tool_calls': [{
+                        'function': {
+                            'name': 'write_file',
+                            'arguments': json.dumps({'filepath': '.gemini/local_plan.md', 'content': '- [ ] Step A'})
+                        }
+                    }]
+                }
+            },
+            # Phase 1: Planning Turn 2 (Finished planning)
+            {'message': {'role': 'assistant', 'content': 'Plan created.'}},
+            # Phase 2: Execution Turn 1 (Execute)
+            {'message': {'role': 'assistant', 'content': 'Executed.'}},
+            # Phase 2: Reflection
+            {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}},
+            # Phase 2: Nudge Turn 1
+            {'message': {'role': 'assistant', 'content': 'Acknowledged nudge 1.'}},
+            # Phase 2: Nudge Turn 2
+            {'message': {'role': 'assistant', 'content': 'Acknowledged nudge 2.'}}
+        ]
+        
+        # We need to mock os.path.exists and open to simulate the plan file handling
+        with patch("os.path.exists") as mock_exists, \
+             patch("builtins.open", mock_open(read_data="- [ ] Step A")) as mock_file, \
+             patch("os.remove") as mock_remove:
+             
+            # Return False for the first call (plan not created), then True for all subsequent calls
+            mock_exists.side_effect = lambda path: path != ".gemini/local_plan.md" or mock_exists.call_count > 1
+            
+            result = await ask_local_assistant("Deep work", use_plan=True)
+            
+            # Verify Planning Prompt
+            plan_msg = mock_chat.call_args_list[0][1]['messages'][0]['content']
+            self.assertIn("Senior Technical Planner", plan_msg)
+            
+            # Verify Execution Prompt (Plan Injection)
+            # The execution phase starts at turn 3 (index 2)
+            exec_context_msg = mock_chat.call_args_list[2][1]['messages'][-1]['content']
+            self.assertIn("CURRENT PLAN STATE", exec_context_msg)
+            
+            # Verify Final Output contains the plan
+            self.assertIn("--- EXECUTION PLAN ---", result)
+            self.assertIn("- [ ] Step A", result)
+
+    @patch("ollama.chat")
+    async def test_ask_local_assistant_planning_mode_warning(self, mock_chat):
+        from mcp_server import ask_local_assistant
+        
+        mock_chat.side_effect = [
+            # Phase 1: Planning Turn 1 (Write Plan)
+            {
+                'message': {
+                    'role': 'assistant',
+                    'tool_calls': [{
+                        'function': {
+                            'name': 'write_file',
+                            'arguments': json.dumps({'filepath': '.gemini/local_plan.md', 'content': '- [ ] Step A'})
+                        }
+                    }]
+                }
+            },
+            # Phase 1: Planning Turn 2 (Finished planning)
+            {'message': {'role': 'assistant', 'content': 'Plan created.'}},
+            # Phase 2: Execution Turn 1 (Execute - No update to plan)
+            {'message': {'role': 'assistant', 'content': 'Executed without updating plan.'}},
+            # Phase 2: Reflection
+            {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}},
+            # Phase 2: Nudge Turn 1
+            {'message': {'role': 'assistant', 'content': 'Acknowledged nudge 1.'}},
+            # Phase 2: Nudge Turn 2
+            {'message': {'role': 'assistant', 'content': 'Acknowledged nudge 2.'}}
+        ]
+        
+        with patch("os.path.exists") as mock_exists, \
+             patch("builtins.open", mock_open(read_data="- [ ] Step A")) as mock_file, \
+             patch("os.remove") as mock_remove:
+             
+            # Return False for the first call (plan not created), then True for all subsequent calls
+            mock_exists.side_effect = lambda path: path != ".gemini/local_plan.md" or mock_exists.call_count > 1
+            
+            result = await ask_local_assistant("Deep work", use_plan=True)
+            
+            # Verify Warning
+            self.assertIn("[Warning: Agent executed actions but failed to update the plan checklist.]", result)
+
+
+    @patch("ollama.chat")
     async def test_ask_local_assistant_no_tool(self, mock_chat):
         from mcp_server import ask_local_assistant
         mock_chat.side_effect = [
@@ -181,7 +276,7 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
         
         result = await ask_local_assistant("Do something")
         self.assertIn("maximum turn limit", result)
-        self.assertEqual(mock_chat.call_count, 10)
+        self.assertEqual(mock_chat.call_count, 15)
 
     @patch("ollama.chat")
     async def test_ask_local_assistant_agent_read_missing(self, mock_chat):

@@ -130,7 +130,8 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
             {'message': {'role': 'assistant', 'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepath': 'f.txt'}}}]}},
             {'message': {'role': 'assistant', 'tool_calls': [{'function': {'name': 'write_file', 'arguments': {'filepath': 'w.txt', 'content': 'c'}}}]}},
             {'message': {'role': 'assistant', 'tool_calls': [{'function': {'name': 'run_shell_command', 'arguments': {'command': 'ls'}}}]}},
-            {'message': {'role': 'assistant', 'content': 'Done'}}
+            {'message': {'role': 'assistant', 'content': 'Done'}},
+            {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}}
         ]
         
         with patch("mcp_server._read_local_file", return_value="read"):
@@ -138,7 +139,7 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
                 with patch("mcp_server.run_shell_command", new_callable=AsyncMock, return_value="ran"):
                     result = await mcp_server.ask_local_assistant("hi")
                     self.assertEqual(result, "Done")
-                    self.assertEqual(sys.modules["ollama"].chat.call_count, 5)
+                    self.assertEqual(sys.modules["ollama"].chat.call_count, 6)
 
     async def test_ask_local_assistant_turn_limit(self):
         # Always return a tool call to hit the turn limit
