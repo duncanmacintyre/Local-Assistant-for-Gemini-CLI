@@ -80,31 +80,39 @@ This project implements the **"Cloud Brain, Local Hands"** pattern:
 
 This section outlines upcoming features planned for the Local Assistant, prioritizing enhancements for robustness, intelligence, and user experience.
 
-### 1. Technical Robustness: Handling Large Files
+### 1. Robust Planning: Better Vague Task Handling
+*   **Problem:** The assistant can struggle to formulate a concrete plan when given broad or vague instructions (e.g., "Audit the code"), leading to failures during the planning phase.
+*   **Action:** Improve the planning logic for vague tasks. This may involve a mandatory "discovery turn" to explore the codebase before committing to a plan, or more structured "Thinking" prompts to help the model decompose abstract goals.
+
+### 2. Streamlined Execution: Faster Turnaround
+*   **Problem:** The iterative "Think-Act-Observe" loop can feel slow due to the overhead of plan management and sequential tool calls.
+*   **Action:** Speed up planning and execution by streamlining tool interactions. This includes reducing round-trips for plan updates (e.g., using an in-memory state that only persists periodically), batching operations like `read_file` for multiple paths, and supporting parallel tool execution.
+
+### 3. Technical Robustness: Handling Large Files
 *   **Problem:** Current file reading mechanisms can fail or lose context with very large text files or PDFs, exceeding local model token limits.
 *   **Action:** Implement context chunking and pagination for handling large files. This will include a "summarize-on-load" feature for substantial documents to ensure manageable input for the local agent.
 
-### 2. Local RAG: Semantic Search and Project Indexing
+### 4. Local RAG: Semantic Search and Project Indexing
 *   **Problem:** The assistant's current search capabilities are limited to basic text matching (`grep`, `find`), which is inefficient for understanding complex codebases or answering semantic queries.
 *   **Action:** Integrate a local Vector Database (e.g., ChromaDB, FAISS) for project-wide indexing. This will enable a new `semantic_search` tool for the local agent, allowing for more intelligent and context-aware code exploration.
 
-### 3. Privacy-Conscious Web Search
+### 5. Privacy-Conscious Web Search
 *   **Problem:** The assistant currently lacks real-time information access from the web, limiting its ability to consult external documentation or current data.
 *   **Action:** Introduce an opt-in `live_search` tool. This feature will allow the local agent to perform web searches (e.g., via Perplexity) without compromising local file privacy by only sending specific queries.
 
-### 4. Dynamic Model Ecosystem
+### 6. Dynamic Model Ecosystem
 *   **Problem:** A single, monolithic local model is used for all tasks, which may not be optimal for performance, cost, or specialized capabilities.
 *   **Action:** Implement dynamic model routing. The assistant will be able to select the most appropriate local model based on the task at hand (e.g., a coding-specific model for code generation, a general-purpose model for summarization).
 
-### 5. Interactive Clarification
+### 7. Interactive Clarification
 *   **Problem:** Currently, if the local agent encounters ambiguity (e.g., "Which file?"), it has to guess or fail because it cannot ask the user for help during execution.
 *   **Action:** Implement a "suspend-and-resume" protocol. The agent will be able to return a question to Gemini, which asks the user, and then resumes the local agent with the user's answer and the previous context preserved.
 
-### 6. Batch Tool Operations
+### 8. Batch Tool Operations
 *   **Problem:** The agent currently reads files or runs commands one at a time, leading to excessive "thinking" pauses and slow execution for tasks involving multiple files.
 *   **Action:** Update tools like `read_file` to accept lists of arguments (e.g., `filepaths=['a.txt', 'b.txt']`). This allows the agent to gather all necessary context in a single turn, significantly reducing latency.
 
-### 7. Safe Mode (Read-Only)
+### 9. Safe Mode (Read-Only)
 *   **Problem:** Even with sandboxing, a powerful agent might accidentally overwrite a file or run a destructive command during complex investigations.
 *   **Action:** Expose a dedicated `ask_local_assistant_readonly` tool. This version will strictly lack `write_file` and `run_shell_command` capabilities, allowing users to perform "pure" analysis and summarization with zero risk of side effects.
 
