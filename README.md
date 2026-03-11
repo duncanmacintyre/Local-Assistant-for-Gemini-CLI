@@ -64,6 +64,15 @@ For complex tasks (e.g., "Refactor the entire module" or "Investigate this bug a
     gemini -s "Use the local assistant in planning mode to refactor the test suite."
     ```
 
+## ✨ Key Features
+*   **Recursive Codebase Search:** Uses `grep`, `rg`, and `find` to explore projects of any size.
+*   **Intelligent Planning:** For complex tasks, the assistant generates a Markdown checklist and executes it step-by-step.
+*   **Batch Operations:** Tools like `read_file` and `run_shell_command` support multiple paths/commands in a single turn, significantly reducing latency.
+*   **Context Guard:** Automatically detects large outputs and truncates them with segmentation instructions (offset/limit/pages), preventing local model context overflow.
+*   **Model Discovery:** Automatically detects your local model's native context limit and optimizes reasoning accordingly.
+*   **Interactive Clarification:** If a task is ambiguous, the assistant can pause and ask the user for missing information via Gemini.
+*   **PDF Support:** Native PDF reading and page-by-page extraction.
+
 ## 🏗️ Architecture
 
 This project implements the **"Cloud Brain, Local Hands"** pattern:
@@ -76,7 +85,7 @@ This project implements the **"Cloud Brain, Local Hands"** pattern:
     *   It *observes* the output and refines its plan.
 4.  Once finished, it returns the final answer to Gemini.
 
-## ✨ Future Features
+## 🗺️ Roadmap
 
 This section outlines upcoming features planned for the Local Assistant, prioritizing enhancements for robustness, intelligence, and user experience.
 
@@ -84,35 +93,23 @@ This section outlines upcoming features planned for the Local Assistant, priorit
 *   **Problem:** The assistant can struggle to formulate a concrete plan when given broad or vague instructions (e.g., "Audit the code"), leading to failures during the planning phase.
 *   **Action:** Improve the planning logic for vague tasks. This may involve a mandatory "discovery turn" to explore the codebase before committing to a plan, or more structured "Thinking" prompts to help the model decompose abstract goals.
 
-### 2. Streamlined Execution: Faster Turnaround
-*   **Problem:** The iterative "Think-Act-Observe" loop can feel slow due to the overhead of plan management and sequential tool calls.
-*   **Action:** Speed up planning and execution by streamlining tool interactions. This includes reducing round-trips for plan updates (e.g., using an in-memory state that only persists periodically), batching operations like `read_file` for multiple paths, and supporting parallel tool execution.
+### 2. Intelligent Summarization Pass
+*   **Problem:** For extremely large files (massive logs or long legal documents), simply truncating or reading page-by-page can be slow for getting a high-level overview.
+*   **Action:** Add an optional `summarize` flag to tools. If enabled, the local agent will perform a quick local summarization pass (using the local model) before returning the text to Gemini.
 
-### 3. Technical Robustness: Handling Large Files
-*   **Problem:** Current file reading mechanisms can fail or lose context with very large text files or PDFs, exceeding local model token limits.
-*   **Action:** Implement context chunking and pagination for handling large files. This will include a "summarize-on-load" feature for substantial documents to ensure manageable input for the local agent.
-
-### 4. Local RAG: Semantic Search and Project Indexing
+### 3. Local RAG: Semantic Search and Project Indexing
 *   **Problem:** The assistant's current search capabilities are limited to basic text matching (`grep`, `find`), which is inefficient for understanding complex codebases or answering semantic queries.
 *   **Action:** Integrate a local Vector Database (e.g., ChromaDB, FAISS) for project-wide indexing. This will enable a new `semantic_search` tool for the local agent, allowing for more intelligent and context-aware code exploration.
 
-### 5. Privacy-Conscious Web Search
+### 4. Privacy-Conscious Web Search
 *   **Problem:** The assistant currently lacks real-time information access from the web, limiting its ability to consult external documentation or current data.
 *   **Action:** Introduce an opt-in `live_search` tool. This feature will allow the local agent to perform web searches (e.g., via Perplexity) without compromising local file privacy by only sending specific queries.
 
-### 6. Dynamic Model Ecosystem
+### 5. Dynamic Model Ecosystem
 *   **Problem:** A single, monolithic local model is used for all tasks, which may not be optimal for performance, cost, or specialized capabilities.
 *   **Action:** Implement dynamic model routing. The assistant will be able to select the most appropriate local model based on the task at hand (e.g., a coding-specific model for code generation, a general-purpose model for summarization).
 
-### 7. Interactive Clarification
-*   **Problem:** Currently, if the local agent encounters ambiguity (e.g., "Which file?"), it has to guess or fail because it cannot ask the user for help during execution.
-*   **Action:** Implement a "suspend-and-resume" protocol. The agent will be able to return a question to Gemini, which asks the user, and then resumes the local agent with the user's answer and the previous context preserved.
-
-### 8. Batch Tool Operations
-*   **Problem:** The agent currently reads files or runs commands one at a time, leading to excessive "thinking" pauses and slow execution for tasks involving multiple files.
-*   **Action:** Update tools like `read_file` to accept lists of arguments (e.g., `filepaths=['a.txt', 'b.txt']`). This allows the agent to gather all necessary context in a single turn, significantly reducing latency.
-
-### 9. Safe Mode (Read-Only)
+### 6. Safe Mode (Read-Only)
 *   **Problem:** Even with sandboxing, a powerful agent might accidentally overwrite a file or run a destructive command during complex investigations.
 *   **Action:** Expose a dedicated `ask_local_assistant_readonly` tool. This version will strictly lack `write_file` and `run_shell_command` capabilities, allowing users to perform "pure" analysis and summarization with zero risk of side effects.
 
@@ -143,4 +140,3 @@ To completely remove the Local Assistant:
 MIT
 
 Software developed with Gemini 3.0 Pro in Gemini CLI.
-

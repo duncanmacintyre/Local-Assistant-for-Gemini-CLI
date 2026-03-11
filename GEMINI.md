@@ -6,11 +6,13 @@ This project provides a secure, private bridge between the cloud-based Gemini CL
 
 - **Frontend:** Gemini CLI running in **Interactive Mode**.
 - **Integration:** Runs as a child process via **Stdio** transport.
+- **Discovery Layer:** Automatically inspects the local model (Ollama) to detect native context limits.
+- **Execution Engine:** Iterative loop with a **Context Guard** that truncates large outputs to prevent memory overflow.
 - **Security Layer:** 
     - **Inherited Sandbox:** Relies on the Gemini CLI's `sandbox-exec` wrapper (`gemini -s`).
     - **Self-Check:** The assistant refuses to start unless it detects it is running within a macOS sandbox via `libsandbox`.
 - **Backend Models:**
-    - **Local (User Choice):** Default is `qwen3-coder:30b` (or user selection) via Ollama.
+    - **Local (User Choice):** Default is `qwen3-coder:30b` via Ollama.
     - **Cloud Brain (Gemini):** High-level reasoning and orchestrator.
 
 ### Model Ecosystem
@@ -63,8 +65,11 @@ Tests cover:
 ### Tools
 Tools are defined using the `@mcp.tool()` decorator in `mcp_server.py`. Primary tools include:
 - **`ask_local_assistant`:** The main iterative reasoning agent.
-- **`run_shell_command`:** Executes `zsh` commands (restricted by the inherited sandbox).
-- **`read_file/write_file`:** Direct file access within the working directory.
+- **`run_shell_command`:** Executes `zsh` commands (batch support).
+- **`read_file`:** Reads files with `offset/limit/pages` (batch support).
+- **`write_file`:** Direct file access within the working directory.
+- **`get_model_info`:** Retrieves local model metadata.
+- **`request_clarification`:** Pauses execution to ask the user a question.
 - **`list_local_models`:** Lists available Ollama models.
 
 ### Code Structure
@@ -83,11 +88,8 @@ If a tool is intended to be used *internally* by the local agent, it must be add
 
 ## Future Roadmap
 
-- [ ] **Robust Planning:** Improve the local assistant's planning capability for vague or complex tasks.
-- [ ] **Streamlined Execution:** Reduce round-trips for plan updates and support batch/parallel tool execution.
-- [ ] **Technical Robustness:** Implement context chunking and pagination for handling large text/PDF files.
-- [ ] **Local RAG:** Integrate a local Vector DB (e.g., ChromaDB) for project-wide semantic search.
-- [ ] **Privacy-Conscious Web Search:** Add an opt-in `live_search` tool for web-hybrid queries.
-- [ ] **Dynamic Model Routing:** Support task-specific model selection (e.g., specialized coding models).
-- [ ] **Interactive Clarification:** Allow the local agent to pause and ask the user questions via Gemini.
-- [ ] **Safe Mode (Read-Only):** A dedicated `ask_local_assistant_readonly` tool with zero write/execute permissions.
+- [ ] **Robust Planning:** Improve vague task handling via discovery turns.
+- [ ] **Intelligent Summarization Pass:** Optional flag for summarizing massive files.
+- [ ] **Local RAG:** Integrate Vector DB for project-wide semantic search.
+- [ ] **Safe Mode (Read-Only):** A dedicated tool with zero write/execute permissions.
+- [ ] **Dynamic Model Routing:** Support task-specific model selection.

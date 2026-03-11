@@ -35,10 +35,13 @@ def is_sandboxed() -> bool:
     except Exception:
         return False
 
-def _read_local_file(filepath: str, offset: int = 0, limit: int = None, pages: list[int] = None) -> str:
-    """Helper to read text or PDF files locally with support for partial reading."""
+def _read_local_file(filepath: str, offset: int = 0, limit: int = None, pages: list[int] = None, tail: int = None) -> tuple[str, int, str]:
+    """
+    Helper to read text or PDF files locally.
+    Returns: (content_string, total_units, unit_name)
+    """
     if not os.path.exists(filepath):
-        return f"[Error: File {filepath} not found]"
+        return f"[Error: File {filepath} not found]", 0, "unknown"
 
     if filepath.lower().endswith(".pdf"):
         try:
@@ -46,29 +49,71 @@ def _read_local_file(filepath: str, offset: int = 0, limit: int = None, pages: l
             total_pages = len(reader.pages)
             text = ""
             
-            # If pages are specified, use them (1-indexed for user convenience)
-            target_pages = pages if pages else range(1, total_pages + 1)
+            # If tail is specified for PDF, get the last N pages
+            if tail:
+                target_pages = range(max(1, total_pages - tail + 1), total_pages + 1)
+            else:
+                target_pages = pages if pages else range(1, total_pages + 1)
             
             for p_num in target_pages:
                 if 1 <= p_num <= total_pages:
-                    # Show header if specifically requested pages OR if multi-page document
-                    if pages or total_pages > 1:
+                    if total_pages > 1:
                         text += f"--- Page {p_num} ---\n"
                     text += reader.pages[p_num - 1].extract_text() + "\n"
-                else:
-                    text += f"[Warning: Page {p_num} out of range (Total pages: {total_pages})]\n"
-            return text
+            return text, total_pages, "pages"
         except Exception as e:
-            return f"[Error reading PDF {filepath}: {str(e)}]"
+            return f"[Error reading PDF {filepath}: {str(e)}]", 0, "pages"
     else:
         try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                # Use offset/limit for text files (lines) efficiently with islice
-                stop = (offset + limit) if limit else None
-                gen = islice(f, offset, stop)
-                return "".join(gen)
+            # Efficient buffered line count
+            total_lines = 0
+            with open(filepath, 'rb') as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    total_lines += chunk.count(b'\n')
+            
+            # If the file doesn't end in a newline but has content, it's still a line
+            if total_lines == 0 and os.path.getsize(filepath) > 0:
+                total_lines = 1
+
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                if tail:
+                    # For tail, we calculate the offset
+                    start_line = max(0, total_lines - tail)
+                    gen = islice(f, start_line, None)
+                else:
+                    stop = (offset + limit) if limit else None
+                    gen = islice(f, offset, stop)
+                return "".join(gen), total_lines, "lines"
         except Exception as e:
-            return f"[Error reading file {filepath}: {str(e)}]"
+            return f"[Error reading file {filepath}: {str(e)}]", 0, "lines"
+
+@mcp.tool()
+async def get_model_info(model: str = LOCAL_WORKER_MODEL) -> str:
+    """
+    Retrieves detailed metadata for a specific Ollama model, including its native context limit.
+    """
+    try:
+        info = ollama.show(model)
+        model_info = info.get('modelinfo', {})
+        
+        # Look for context length in common architecture-specific keys
+        ctx_len = None
+        for key in model_info:
+            if 'context_length' in key:
+                ctx_len = model_info[key]
+                break
+        
+        details = {
+            "model": model,
+            "context_length": ctx_len or "unknown (defaulting to 32k)",
+            "parameter_size": info.get('details', {}).get('parameter_size', 'unknown'),
+            "quantization": info.get('details', {}).get('quantization_level', 'unknown'),
+            "architecture": model_info.get('general.architecture', 'unknown')
+        }
+        return json.dumps(details, indent=2)
+    except Exception as e:
+        logger.error(f"Error fetching model info for {model}: {e}")
+        return f"Error: Could not retrieve info for model '{model}'."
 
 @mcp.tool()
 async def list_local_models() -> str:
@@ -151,26 +196,40 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
     """
     logger.info(f"Local Agent: Initializing iterative loop with model {model} (Planning Mode: {use_plan}, Context Window: {num_ctx})")
     
+    # Discovery Phase: Get model context limit
+    try:
+        raw_info = await get_model_info(model)
+        model_meta = json.loads(raw_info)
+        native_ctx = model_meta.get('context_length')
+        model_ctx_msg = f"LOCAL MODEL CAPABILITIES: Model '{model}' reports a native context limit of {native_ctx} tokens.\n"
+    except Exception:
+        model_ctx_msg = ""
+
     # Define available tools
     tools = [
         {
             'type': 'function',
             'function': {
                 'name': 'read_file',
-                'description': 'Read content from a file.',
+                'description': 'Read content from one or more files.',
                 'parameters': {
                     'type': 'object',
                     'properties': {
-                        'filepath': {'type': 'string', 'description': 'Path to the file to read.'},
+                        'filepaths': {
+                            'type': 'array', 
+                            'items': {'type': 'string'}, 
+                            'description': 'List of paths to the files to read.'
+                        },
                         'offset': {'type': 'integer', 'description': 'Line number to start reading from (text files).'},
                         'limit': {'type': 'integer', 'description': 'Number of lines to read (text files).'},
+                        'tail': {'type': 'integer', 'description': 'Number of lines/pages to read from the END of the file.'},
                         'pages': {
                             'type': 'array', 
                             'items': {'type': 'integer'}, 
                             'description': 'List of page numbers to read (PDF files, 1-indexed).'
                         },
                     },
-                    'required': ['filepath'],
+                    'required': ['filepaths'],
                 },
             },
         },
@@ -207,26 +266,74 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
             'type': 'function',
             'function': {
                 'name': 'run_shell_command',
-                'description': 'Execute a shell command (zsh).',
+                'description': 'Execute one or more shell commands (zsh).',
                 'parameters': {
                     'type': 'object',
                     'properties': {
-                        'command': {'type': 'string', 'description': 'The zsh command to execute.'},
+                        'command': {'type': 'string', 'description': 'A single zsh command to execute.'},
+                        'commands': {
+                            'type': 'array',
+                            'items': {'type': 'string'},
+                            'description': 'A list of zsh commands to execute sequentially.'
+                        },
                     },
-                    'required': ['command'],
+                },
+            },
+        },
+        {
+            'type': 'function',
+            'function': {
+                'name': 'request_clarification',
+                'description': 'Ask the user for missing information or to resolve an ambiguity.',
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'question': {'type': 'string', 'description': 'The question to ask the user.'},
+                    },
+                    'required': ['question'],
                 },
             },
         },
     ]
 
     async def execute_tool(func_name, args):
+        # A conservative estimation: 3.5 characters per token. 
+        # num_ctx is in tokens.
+        safe_char_limit = int(num_ctx * 0.25 * 3.5)
+        # Cap at a reasonable maximum to prevent massive strings being returned even if num_ctx is huge
+        absolute_max_chars = 64000
+        char_limit = min(safe_char_limit, absolute_max_chars)
+
+        def truncate_with_meta(text, unit_name, total_units):
+            if len(text) > char_limit:
+                truncated = text[:char_limit]
+                footer = (
+                    f"\n\n[WARNING: Output truncated due to context limits ({len(text)} chars > {char_limit} limit). "
+                    f"This file has {total_units} {unit_name} total. "
+                    f"Use 'offset'/'limit' or 'pages' to read the next segment.]"
+                )
+                return truncated + footer
+            return text
+
         if func_name == "read_file":
-            return _read_local_file(
-                args.get('filepath', ""),
-                offset=args.get('offset', 0),
-                limit=args.get('limit'),
-                pages=args.get('pages')
-            )
+            fps = args.get('filepaths')
+            if not fps:
+                fps = [args.get('filepath', "")]
+            
+            results = []
+            for fp in fps:
+                res, total, unit = _read_local_file(
+                    fp,
+                    offset=args.get('offset', 0),
+                    limit=args.get('limit'),
+                    pages=args.get('pages'),
+                    tail=args.get('tail')
+                )
+                res = truncate_with_meta(res, unit, total)
+                # Wrap each file's output with a header including total units
+                results.append(f"--- FILE: {fp} ({total} {unit} total) ---\n{res}\n")
+            return "\n".join(results)
+
         elif func_name == "write_file":
             fp = args.get('filepath', "")
             try:
@@ -240,7 +347,24 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
         elif func_name == "complete_plan_step":
             return await complete_plan_step(args.get('step_index', 0))
         elif func_name == "run_shell_command":
-            return await run_shell_command(args.get('command', ""))
+            cmds = args.get('commands')
+            if not cmds:
+                cmds = [args.get('command', "")]
+            
+            results = []
+            for cmd in cmds:
+                if not cmd: continue
+                res = await run_shell_command(cmd)
+                # Count lines for metadata in shell command context
+                total_lines = res.count('\n') + 1
+                res = truncate_with_meta(res, "lines", total_lines)
+                if len(cmds) > 1:
+                    results.append(f"--- COMMAND: {cmd} ---\n{res}\n")
+                else:
+                    results.append(res)
+            return "\n".join(results)
+        elif func_name == "request_clarification":
+            return f"CLARIFICATION_REQUIRED: {args.get('question', 'What do you need?')}"
         return f"Unknown tool: {func_name}"
 
     # --- PHASE 1: FORCED PLANNING (If enabled) ---
@@ -268,7 +392,7 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
         
         plan_created = False
         attempted_paths = []
-        planning_tools = [t for t in tools if t['function']['name'] in ['write_file', 'read_file', 'run_shell_command']]
+        planning_tools = [t for t in tools if t['function']['name'] in ['write_file', 'read_file', 'run_shell_command', 'request_clarification']]
 
         for i in range(10): # Max 10 turns to explore + write a plan
             logger.info(f"Planning Turn {i+1}/10")
@@ -297,6 +421,9 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
                 result = await execute_tool(func_name, args)
                 plan_messages.append({'role': 'tool', 'content': result, 'name': func_name})
                 
+                if result.startswith("CLARIFICATION_REQUIRED:"):
+                    return result
+
                 if func_name == "write_file":
                     fp = args.get('filepath', "")
                     attempted_paths.append(fp)
@@ -320,18 +447,25 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
         "You act as the local 'hands' for a Cloud-based Brain (Gemini). You process sensitive data "
         "locally to ensure privacy. You have access to the current project directory.\n\n"
         
+        f"{model_ctx_msg}"
         "PRIORITY 1: PRECISION & ADHERENCE\n"
         "Always prioritize the user's specific request. If the user asks for extraction (e.g., 'Who are the authors?'), "
         "provide ONLY that information. Do NOT provide high-level summaries unless explicitly asked.\n\n"
 
         "CAPABILITIES & TOOLS:\n"
-        "- 'run_shell_command': Run zsh commands. You have access to standard macOS utilities: grep, rg, sed, awk, find, ls, cat, etc.\n"
-        "  * Use 'rg' (ripgrep) for high-performance text searching.\n"
-        "  * Use 'awk' or 'column' for processing structured/tabular text.\n"
-        "- 'read_file': Read text OR PDF files. PDFs are automatically converted to text for you.\n"
+        "- 'run_shell_command': Run one or more zsh commands. Use standard macOS utilities: grep, rg, find, ls, sed, awk, cat, column, etc.\n"
+        "  * You can pass a list of 'commands' to execute multiple operations in a single turn.\n"
+        "  * EFFICIENT FILTERING: Use 'grep', 'sed', 'awk', or 'column' to extract only the necessary data locally. This is faster and prevents hitting the Context Guard's truncation limits.\n"
+        "- 'read_file': Read text OR PDF files. \n"
+        "  * You can pass a list of 'filepaths' to read multiple files at once.\n"
         "  * Use 'offset' and 'limit' (lines) for text files to avoid context overload.\n"
-        "  * Use 'pages' (list of ints) for PDFs. For metadata like authors/titles, usually only Page 1 is needed.\n"
-        "- 'write_file': Save results or summaries to a file.\n\n"
+        "  * Use 'tail' (int) to read the last N lines/pages. This is great for logs or the end of documents.\n"
+        "  * Use 'pages' (list of ints) for PDFs. For metadata, usually only Page 1 is needed.\n"
+        "  * WARNING: Large outputs will be automatically truncated. Use segmentation to read long files.\n"
+        "- 'write_file': Save results or summaries to a file.\n"
+        "- 'get_model_info': Inspect local model details (context limit, etc.) if needed.\n"
+        "- 'request_clarification': If you are stuck because the user's request is ambiguous or missing info, "
+        "use this to ask the user a specific question. This will pause your execution.\n\n"
         
         "CONSTRAINTS:\n"
         "- Stay focused on the task.\n"
@@ -527,6 +661,10 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
                 
                 result = await execute_tool(func_name, args)
                 messages.append({'role': 'tool', 'content': result, 'name': func_name})
+
+                # --- CLARIFICATION BREAK ---
+                if result.startswith("CLARIFICATION_REQUIRED:"):
+                    return result
         
         return f"Local Agent reached the maximum turn limit ({MAX_TURNS}) without finishing the task."
         

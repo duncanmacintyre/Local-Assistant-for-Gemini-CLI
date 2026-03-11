@@ -48,7 +48,10 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
             f.write("hello world")
         
         from mcp_server import _read_local_file as read_fn
-        self.assertEqual(read_fn(test_file), "hello world")
+        content, total, unit = read_fn(test_file)
+        self.assertEqual(content, "hello world")
+        self.assertEqual(total, 1)
+        self.assertEqual(unit, "lines")
 
     def test_read_local_file_text_partial(self):
         test_file = os.path.join(self.test_dir, "lines.txt")
@@ -56,8 +59,12 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
             f.write("line1\nline2\nline3\nline4\n")
         
         from mcp_server import _read_local_file as read_fn
-        self.assertEqual(read_fn(test_file, offset=2), "line3\nline4\n")
-        self.assertEqual(read_fn(test_file, offset=1, limit=2), "line2\nline3\n")
+        content, total, unit = read_fn(test_file, offset=2)
+        self.assertEqual(content, "line3\nline4\n")
+        self.assertEqual(total, 4)
+        content, total, unit = read_fn(test_file, offset=1, limit=2)
+        self.assertEqual(content, "line2\nline3\n")
+        self.assertEqual(total, 4)
 
     @patch("mcp_server.PdfReader")
     def test_read_local_file_pdf_partial(self, mock_pdf_reader):
@@ -73,15 +80,17 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
         mock_pdf_reader.return_value.pages = [p1, p2]
         
         from mcp_server import _read_local_file as read_fn
-        result = read_fn(test_pdf, pages=[2])
-        self.assertIn("page 2 text", result)
-        self.assertNotIn("page 1 text", result)
-        self.assertIn("--- Page 2 ---", result)
+        content, total, unit = read_fn(test_pdf, pages=[2])
+        self.assertIn("page 2 text", content)
+        self.assertNotIn("page 1 text", content)
+        self.assertIn("--- Page 2 ---", content)
+        self.assertEqual(total, 2)
+        self.assertEqual(unit, "pages")
 
     def test_read_local_file_not_found(self):
         from mcp_server import _read_local_file as read_fn
-        result = read_fn("missing_file_xyz.txt")
-        self.assertIn("not found", result)
+        content, total, unit = read_fn("missing_file_xyz.txt")
+        self.assertIn("not found", content)
 
     @patch("mcp_server.PdfReader")
     def test_read_local_file_pdf_corrupt(self, mock_pdf_reader):
@@ -91,8 +100,8 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
         mock_pdf_reader.side_effect = Exception("Invalid PDF format")
         
         from mcp_server import _read_local_file as read_fn
-        result = read_fn(bad_pdf)
-        self.assertIn("Error reading PDF", result)
+        content, total, unit = read_fn(bad_pdf)
+        self.assertIn("Error reading PDF", content)
 
     # --- Tool Execution Tests ---
 
@@ -249,7 +258,7 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
                 'message': {
                     'role': 'assistant',
                     'content': 'Thinking...',
-                    'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepath': test_file}}}]
+                    'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepaths': [test_file]}}}]
                 }
             },
             {'message': {'role': 'assistant', 'content': 'Done!'}},
@@ -273,7 +282,7 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
         mock_chat.return_value = {
             'message': {
                 'role': 'assistant',
-                'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepath': 'dummy'}}}]
+                'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepaths': ['dummy']}}}]
             }
         }
         
@@ -334,7 +343,8 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
         
         final_history = mock_chat.call_args_list[1][1]['messages']
         tool_msg = next(m for m in final_history if m['role'] == 'tool')
-        self.assertEqual(tool_msg['content'], "line2\n")
+        expected_content = f"--- FILE: {test_file} (3 lines total) ---\nline2\n\n"
+        self.assertEqual(tool_msg['content'], expected_content)
 
     # --- Model & Ollama Tool Tests ---
 

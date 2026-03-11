@@ -42,7 +42,10 @@ def test_read_local_file_text(tmp_path):
     test_file.write_text("hello world", encoding="utf-8")
     
     from mcp_server import _read_local_file as read_fn
-    assert read_fn(str(test_file)) == "hello world"
+    content, total, unit = read_fn(str(test_file))
+    assert content == "hello world"
+    assert total == 1
+    assert unit == "lines"
 
 def test_read_local_file_text_partial(tmp_path):
     """Test reading a text file with offset and limit."""
@@ -51,9 +54,13 @@ def test_read_local_file_text_partial(tmp_path):
     
     from mcp_server import _read_local_file as read_fn
     # Test offset only
-    assert read_fn(str(test_file), offset=2) == "line3\nline4\n"
+    content, total, unit = read_fn(str(test_file), offset=2)
+    assert content == "line3\nline4\n"
+    assert total == 4
     # Test offset and limit
-    assert read_fn(str(test_file), offset=1, limit=2) == "line2\nline3\n"
+    content, total, unit = read_fn(str(test_file), offset=1, limit=2)
+    assert content == "line2\nline3\n"
+    assert total == 4
 
 @patch("mcp_server.PdfReader")
 def test_read_local_file_pdf_partial(mock_pdf_reader, tmp_path):
@@ -70,16 +77,18 @@ def test_read_local_file_pdf_partial(mock_pdf_reader, tmp_path):
     
     from mcp_server import _read_local_file as read_fn
     # Test reading only page 2
-    result = read_fn(str(test_pdf), pages=[2])
-    assert "page 2 text" in result
-    assert "page 1 text" not in result
-    assert "--- Page 2 ---" in result
+    content, total, unit = read_fn(str(test_pdf), pages=[2])
+    assert "page 2 text" in content
+    assert "page 1 text" not in content
+    assert "--- Page 2 ---" in content
+    assert total == 2
+    assert unit == "pages"
 
 def test_read_local_file_not_found():
     """Verify error message for non-existent files."""
     from mcp_server import _read_local_file as read_fn
-    result = read_fn("missing_file_xyz.txt")
-    assert "not found" in result
+    content, total, unit = read_fn("missing_file_xyz.txt")
+    assert "not found" in content
 
 @patch("mcp_server.PdfReader")
 def test_read_local_file_pdf_corrupt(mock_pdf_reader, tmp_path):
@@ -89,8 +98,8 @@ def test_read_local_file_pdf_corrupt(mock_pdf_reader, tmp_path):
     mock_pdf_reader.side_effect = Exception("Invalid PDF format")
     
     from mcp_server import _read_local_file as read_fn
-    result = read_fn(str(bad_pdf))
-    assert "Error reading PDF" in result
+    content, total, unit = read_fn(str(bad_pdf))
+    assert "Error reading PDF" in content
 
 # --- Tool Execution Tests ---
 
@@ -262,7 +271,7 @@ async def test_ask_local_assistant_multiple_turns(mock_chat, tmp_path):
             'message': {
                 'role': 'assistant',
                 'content': 'Thinking about reading...',
-                'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepath': str(test_file)}}}]
+                'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepaths': [str(test_file)]}}}]
             }
         },
         {'message': {'role': 'assistant', 'content': 'Done!'}},
@@ -296,7 +305,7 @@ async def test_ask_local_assistant_reflection_incomplete(mock_chat):
         # 3. Agent reacts to system message injecting the reason -> Calls tool
         {'message': {
             'role': 'assistant', 
-            'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepath': 'fileB.txt'}}}]
+            'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepaths': ['fileB.txt']}}}]
         }},
         
         # 4. Final Answer
@@ -344,7 +353,7 @@ async def test_ask_local_assistant_turn_limit(mock_chat):
     mock_chat.return_value = {
         'message': {
             'role': 'assistant',
-            'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepath': 'dummy'}}}]
+            'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepaths': ['dummy']}}}]
         }
     }
     
@@ -362,7 +371,7 @@ async def test_ask_local_assistant_agent_read_missing(mock_chat):
         {
             'message': {
                 'role': 'assistant',
-                'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepath': 'gone.txt'}}}]
+                'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepaths': ['gone.txt']}}}]
             }
         },
         {'message': {'content': 'The file is gone.'}},
@@ -391,7 +400,7 @@ async def test_ask_local_assistant_read_file_partial(mock_chat, tmp_path):
                 'tool_calls': [{
                     'function': {
                         'name': 'read_file', 
-                        'arguments': {'filepath': str(test_file), 'offset': 1, 'limit': 1}
+                        'arguments': {'filepaths': [str(test_file)], 'offset': 1, 'limit': 1}
                     }
                 }]
             }
@@ -406,7 +415,8 @@ async def test_ask_local_assistant_read_file_partial(mock_chat, tmp_path):
     # The history passed to the 2nd call (index 1) contains the tool output
     final_history = mock_chat.call_args_list[1][1]['messages']
     tool_msg = next(m for m in final_history if m['role'] == 'tool')
-    assert tool_msg['content'] == "line2\n"
+    expected_content = f"--- FILE: {test_file} (3 lines total) ---\nline2\n\n"
+    assert tool_msg['content'] == expected_content
 
 # --- Model & Ollama Tool Tests ---
 
