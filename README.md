@@ -123,6 +123,10 @@ This section outlines upcoming features planned for the Local Assistant, priorit
 *   **Problem:** The "Cloud Brain" (Gemini) currently waits for the "Local Hands" to finish before continuing, preventing simultaneous work (e.g., Gemini researching while the local agent refactors).
 *   **Action:** Explore an asynchronous worker model. This would likely involve a standalone CLI script that Gemini can start as a background process, with a mechanism (like log polling or a status tool) to monitor progress and collect results without blocking the main conversation.
 
+### 9. Standalone CLI Mode
+*   **Problem:** The local assistant is currently tied to the Gemini CLI ecosystem, requiring a Cloud-based "Brain" for orchestration and limiting its use to Gemini users.
+*   **Action:** Develop a standalone terminal frontend. This would allow the local assistant to be used as an independent, 100% private autonomous agent. It would manage its own "Manager" loop locally via Ollama, making it a powerful tool for users in air-gapped or cloud-restricted environments.
+
 ## 🔧 Troubleshooting
 
 | Error Message | Cause & Fix |
