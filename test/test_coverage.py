@@ -58,14 +58,23 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
     # --- File Reading Tests ---
 
     def test_read_local_file_text(self):
+        import io
+        def mock_open_se(path, mode="r", *args, **kwargs):
+            if "b" in mode:
+                return io.BytesIO(b"hello")
+            else:
+                return io.StringIO("hello")
+
         with patch("os.path.exists", return_value=True):
-            with patch("builtins.open", unittest.mock.mock_open(read_data="hello")):
-                result = mcp_server._read_local_file("test.txt")
-                self.assertEqual(result, "hello")
+            with patch("os.path.getsize", return_value=5):
+                with patch("builtins.open", side_effect=mock_open_se):
+                    result, total, unit = mcp_server._read_local_file("test.txt")
+                    self.assertEqual(result, "hello")
+                    self.assertEqual(unit, "lines")
 
     def test_read_local_file_not_found(self):
         with patch("os.path.exists", return_value=False):
-            result = mcp_server._read_local_file("missing.txt")
+            result, total, unit = mcp_server._read_local_file("missing.txt")
             self.assertIn("not found", result)
 
     def test_read_local_file_pdf_success(self):
@@ -73,18 +82,19 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
         mock_page = MagicMock()
         mock_page.extract_text.return_value = "pdf text"
         mock_reader.pages = [mock_page]
-        
+
         with patch("os.path.exists", return_value=True):
             with patch("mcp_server.PdfReader", return_value=mock_reader):
-                result = mcp_server._read_local_file("test.pdf")
+                result, total, unit = mcp_server._read_local_file("test.pdf")
                 self.assertEqual(result, "pdf text\n")
+                self.assertEqual(total, 1)
+                self.assertEqual(unit, "pages")
 
     def test_read_local_file_pdf_error(self):
         with patch("os.path.exists", return_value=True):
             with patch("mcp_server.PdfReader", side_effect=Exception("Bad PDF")):
-                result = mcp_server._read_local_file("test.pdf")
+                result, total, unit = mcp_server._read_local_file("test.pdf")
                 self.assertIn("Error reading PDF", result)
-
     # --- Tool Execution Tests ---
 
     async def test_run_shell_command_success(self):
@@ -134,11 +144,12 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
             {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}}
         ]
         
-        with patch("mcp_server._read_local_file", return_value="read"):
+        with patch("mcp_server._read_local_file", return_value=("read", 1, "lines")):
             with patch("mcp_server.write_file", new_callable=AsyncMock, return_value="wrote"):
                 with patch("mcp_server.run_shell_command", new_callable=AsyncMock, return_value="ran"):
-                    result = await mcp_server.ask_local_assistant("hi")
-                    self.assertEqual(result, "Done")
+                    with patch("mcp_server.get_model_info", new_callable=AsyncMock, return_value='{"context_length": 32000}'):
+                        result = await mcp_server.ask_local_assistant("hi")
+                        self.assertEqual(result, "Done")
                     self.assertEqual(sys.modules["ollama"].chat.call_count, 6)
 
     async def test_ask_local_assistant_turn_limit(self):

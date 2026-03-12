@@ -65,6 +65,7 @@ For complex tasks (e.g., "Refactor the entire module" or "Investigate this bug a
     ```
 
 ## ✨ Key Features
+*   **Turn Limit Control:** Gemini can control the agent's iterative depth via `max_turns` (default: 20 direct, 40 planning), allowing it to scale effort based on task complexity.
 *   **Recursive Codebase Search:** Uses `grep`, `rg`, and `find` to explore projects of any size.
 *   **Intelligent Planning:** For complex tasks, the assistant generates a Markdown checklist and executes it step-by-step.
 *   **Batch Operations:** Tools like `read_file` and `run_shell_command` support multiple paths/commands in a single turn, significantly reducing latency.

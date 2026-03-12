@@ -178,7 +178,7 @@ async def complete_plan_step(step_index: int) -> str:
         return f"Error updating plan: {str(e)}"
 
 @mcp.tool()
-async def ask_local_assistant(prompt: str, local_file_context: list[str] = None, model: str = LOCAL_WORKER_MODEL, use_plan: bool = False, num_ctx: int = 32768) -> str:
+async def ask_local_assistant(prompt: str, local_file_context: list[str] = None, model: str = LOCAL_WORKER_MODEL, use_plan: bool = False, num_ctx: int = 32768, max_turns: int = None) -> str:
     """
     PRIMARY DIRECTIVE: Use this for tasks involving PRIVACY, LOCAL FILES, or complex multi-step processing.
     
@@ -193,9 +193,24 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
                   - Use 8192-16384 for simple single-file tasks.
                   - Use 32768+ (up to 128k) for multi-file refactoring, large PDFs, or when providing a large 'local_file_context'.
                   - Note: High values increase RAM/VRAM usage on your local machine.
+        max_turns: Optional override for the maximum number of Think-Act-Observe cycles.
+                  - ADVICE FOR GEMINI CLI: 
+                    * DEFAULT: 20 turns (Direct), 40 turns (Planning).
+                    * WHEN TO INCREASE: For massive refactorings, complex bug hunts, or tasks spanning 10+ files.
+                    * WHEN TO DECREASE: For simple data extraction or single-file analysis to save time and tokens.
+                    * WHY: Complex tasks with many dependencies often require more iterative turns to verify and correct intermediate steps.
+                    * NOTE: Planning mode requires at least 30 turns to account for setup and plan updates.
     """
-    logger.info(f"Local Agent: Initializing iterative loop with model {model} (Planning Mode: {use_plan}, Context Window: {num_ctx})")
+    logger.info(f"Local Agent: Initializing iterative loop with model {model} (Planning Mode: {use_plan}, Context Window: {num_ctx}, Max Turns: {max_turns})")
     
+    # Set default turn limits
+    if use_plan:
+        if max_turns is not None and max_turns < 30:
+            return f"Warning: Planning mode requires at least 30 turns for reliable execution. You specified {max_turns}. Please increase 'max_turns' or use Direct Execution mode."
+        MAX_TURNS = max_turns if max_turns is not None else 40
+    else:
+        MAX_TURNS = max_turns if max_turns is not None else 20
+
     # Discovery Phase: Get model context limit
     try:
         raw_info = await get_model_info(model)
@@ -501,8 +516,6 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
         ctx_msg = f"Available files: {', '.join(local_file_context)}."
         messages.insert(1, {'role': 'system', 'content': ctx_msg})
 
-    # Increase turns for planning mode as it involves overhead steps (update plan)
-    MAX_TURNS = 30 if use_plan else 15
     turn_count = 0
     has_reflected = False
     plan_nudge_count = 0

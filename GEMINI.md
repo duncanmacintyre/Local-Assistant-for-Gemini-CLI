@@ -64,7 +64,7 @@ Tests cover:
 
 ### Tools
 Tools are defined using the `@mcp.tool()` decorator in `mcp_server.py`. Primary tools include:
-- **`ask_local_assistant`:** The main iterative reasoning agent.
+- **`ask_local_assistant`:** The main iterative reasoning agent. Supports `use_plan`, `num_ctx`, and `max_turns`.
 - **`run_shell_command`:** Executes `zsh` commands (batch support).
 - **`read_file`:** Reads files with `offset/limit/pages` (batch support).
 - **`write_file`:** Direct file access within the working directory.

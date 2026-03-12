@@ -285,11 +285,10 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
                 'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepaths': ['dummy']}}}]
             }
         }
-        
+
         result = await ask_local_assistant("Do something")
         self.assertIn("maximum turn limit", result)
-        self.assertEqual(mock_chat.call_count, 15)
-
+        self.assertEqual(mock_chat.call_count, 20)
     @patch("ollama.chat")
     async def test_ask_local_assistant_agent_read_missing(self, mock_chat):
         from mcp_server import ask_local_assistant

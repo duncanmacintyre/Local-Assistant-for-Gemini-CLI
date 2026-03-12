@@ -359,7 +359,33 @@ async def test_ask_local_assistant_turn_limit(mock_chat):
     
     result = await ask_local_assistant("Do something")
     assert "maximum turn limit" in result
-    assert mock_chat.call_count == 15
+    assert mock_chat.call_count == 20
+
+@pytest.mark.asyncio
+@patch("ollama.chat")
+async def test_ask_local_assistant_max_turns_override(mock_chat):
+    """Verify that max_turns parameter correctly overrides the default."""
+    from mcp_server import ask_local_assistant
+    mock_chat.return_value = {
+        'message': {
+            'role': 'assistant',
+            'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepaths': ['dummy']}}}]
+        }
+    }
+    
+    result = await ask_local_assistant("Do something", max_turns=5)
+    assert "maximum turn limit (5)" in result
+    assert mock_chat.call_count == 5
+
+@pytest.mark.asyncio
+@patch("ollama.chat")
+async def test_ask_local_assistant_planning_min_turns(mock_chat):
+    """Verify that planning mode enforces a minimum of 30 turns."""
+    from mcp_server import ask_local_assistant
+    
+    result = await ask_local_assistant("Plan something", use_plan=True, max_turns=10)
+    assert "Warning: Planning mode requires at least 30 turns" in result
+    assert mock_chat.call_count == 0  # Should exit before any chat calls
 
 @pytest.mark.asyncio
 @patch("ollama.chat")
