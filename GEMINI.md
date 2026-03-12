@@ -93,3 +93,5 @@ If a tool is intended to be used *internally* by the local agent, it must be add
 - [ ] **Local RAG:** Integrate Vector DB for project-wide semantic search.
 - [ ] **Safe Mode (Read-Only):** A dedicated tool with zero write/execute permissions.
 - [ ] **Dynamic Model Routing:** Support task-specific model selection.
+- [ ] **Subagent Integration:** Refactor into a formal Subagent for cleaner delegation.
+- [ ] **Asynchronous Execution:** Support parallel background processing for long local tasks.

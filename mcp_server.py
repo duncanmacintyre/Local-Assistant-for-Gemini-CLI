@@ -1,7 +1,8 @@
 import os
 import json
 import logging
-import subprocess
+import asyncio
+import signal
 import ctypes
 import sys
 import ollama
@@ -25,6 +26,9 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 LOCAL_WORKER_MODEL = os.getenv("LOCAL_WORKER_MODEL", "qwen3-coder:30b")
 PLAN_FILE = ".gemini/local_plan.md"
 
+# Global set to track active subprocesses for cleanup on cancellation/exit
+active_subprocesses = set()
+
 def is_sandboxed() -> bool:
     """Checks if the process is running within a macOS sandbox (seatbelt)."""
     try:
@@ -34,6 +38,34 @@ def is_sandboxed() -> bool:
         return libsandbox.sandbox_check(os.getpid(), None, 0) == 1
     except Exception:
         return False
+
+def cleanup_resources():
+    """Cleanup active subprocesses and plan files on exit or cancellation."""
+    if os.path.exists(PLAN_FILE):
+        try:
+            os.remove(PLAN_FILE)
+            logger.info(f"Cleaned up {PLAN_FILE}")
+        except Exception as e:
+            logger.error(f"Error cleaning up plan file: {e}")
+            
+    for p in list(active_subprocesses):
+        try:
+            if p.returncode is None:
+                p.terminate()
+                logger.info(f"Terminated background process {p.pid}")
+        except Exception as e:
+            logger.error(f"Error terminating process: {e}")
+    active_subprocesses.clear()
+
+def signal_handler(sig, frame):
+    """Handle termination signals."""
+    logger.info(f"Received signal {sig}, cleaning up...")
+    cleanup_resources()
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 def _read_local_file(filepath: str, offset: int = 0, limit: int = None, pages: list[int] = None, tail: int = None) -> tuple[str, int, str]:
     """
@@ -93,7 +125,8 @@ async def get_model_info(model: str = LOCAL_WORKER_MODEL) -> str:
     Retrieves detailed metadata for a specific Ollama model, including its native context limit.
     """
     try:
-        info = ollama.show(model)
+        client = ollama.AsyncClient(host=OLLAMA_BASE_URL)
+        info = await client.show(model)
         model_info = info.get('modelinfo', {})
         
         # Look for context length in common architecture-specific keys
@@ -121,9 +154,8 @@ async def list_local_models() -> str:
     Lists the available local Ollama models that can be used with ask_local_assistant.
     """
     try:
-        models_info = ollama.list()
-        # The ollama library returns a ModelList object with a list of Model objects
-        # Each Model object has a 'model' attribute for its name.
+        client = ollama.AsyncClient(host=OLLAMA_BASE_URL)
+        models_info = await client.list()
         models = []
         if hasattr(models_info, 'models'):
             models = [m.model for m in models_info.models]
@@ -382,146 +414,148 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
             return f"CLARIFICATION_REQUIRED: {args.get('question', 'What do you need?')}"
         return f"Unknown tool: {func_name}"
 
-    # --- PHASE 1: FORCED PLANNING (If enabled) ---
-    if use_plan:
-        logger.info("Local Agent: Entering Planning Phase...")
-        
-        # 1. Clear old plan
-        if os.path.exists(PLAN_FILE):
-            os.remove(PLAN_FILE)
-            
-        # 2. Planning Loop
-        plan_system_msg = (
-            "You are a Senior Technical Planner. Your goal is to create a detailed, step-by-step implementation plan "
-            "for the user's request. To create a grounded and accurate plan, you should first explore the project "
-            "using 'run_shell_command' (e.g., 'ls -R', 'grep') and 'read_file'.\n\n"
-            f"Once you understand the context, you MUST call the 'write_file' tool to save your plan to the EXACT path: '{PLAN_FILE}'.\n"
-            "Format your plan as a Markdown checklist:\n"
-            "- [ ] Step 1: <Description>\n"
-            "- [ ] Step 2: <Description>\n\n"
-            "Do NOT execute implementation steps yet. Only use discovery tools to inform your plan. "
-            "After writing the plan file, stop."
-        )
-        
-        plan_messages = [{'role': 'system', 'content': plan_system_msg}, {'role': 'user', 'content': prompt}]
-        
-        plan_created = False
-        attempted_paths = []
-        planning_tools = [t for t in tools if t['function']['name'] in ['write_file', 'read_file', 'run_shell_command', 'request_clarification']]
+    client = ollama.AsyncClient(host=OLLAMA_BASE_URL)
 
-        for i in range(10): # Max 10 turns to explore + write a plan
-            logger.info(f"Planning Turn {i+1}/10")
-            response = ollama.chat(
-                model=model, 
-                messages=plan_messages, 
-                tools=planning_tools,
-                options={'num_ctx': num_ctx}
-            )
-            msg = response.get('message', {})
-            logger.info(f"Planning Response: {msg}")
-            plan_messages.append(msg)
-            
-            tool_calls = msg.get('tool_calls')
-            if not tool_calls:
-                if plan_created:
-                    break
-                else:
-                    plan_messages.append({'role': 'system', 'content': f"You must write the plan to '{PLAN_FILE}' using 'write_file' before finishing."})
-                    continue
-
-            for tc in tool_calls:
-                func_name = tc['function']['name']
-                args = json.loads(tc['function']['arguments']) if isinstance(tc['function']['arguments'], str) else tc['function']['arguments']
-                
-                result = await execute_tool(func_name, args)
-                plan_messages.append({'role': 'tool', 'content': result, 'name': func_name})
-                
-                if result.startswith("CLARIFICATION_REQUIRED:"):
-                    return result
-
-                if func_name == "write_file":
-                    fp = args.get('filepath', "")
-                    attempted_paths.append(fp)
-                    if fp.endswith("local_plan.md"):
-                        plan_created = True
-            
-            if plan_created and not any(tc['function']['name'] != 'write_file' for tc in tool_calls):
-                 # If we just wrote the plan and didn't do anything else, we might be done
-                 pass 
-
-        if not plan_created:
-            return f"Error: Agent failed to generate a plan file ({PLAN_FILE}) in Planning Mode. Attempted paths: {attempted_paths}"
-        
-        logger.info("Local Agent: Plan created. Entering Execution Phase.")
-
-    # --- PHASE 2: EXECUTION LOOP (Main) ---
-    
-    base_system_msg = (
-        "IDENTITY & CONTEXT:\n"
-        "You are the 'Local Assistant', a secure autonomous reasoning agent running on the user's computer. "
-        "You act as the local 'hands' for a Cloud-based Brain (Gemini). You process sensitive data "
-        "locally to ensure privacy. You have access to the current project directory.\n\n"
-        
-        f"{model_ctx_msg}"
-        "PRIORITY 1: PRECISION & ADHERENCE\n"
-        "Always prioritize the user's specific request. If the user asks for extraction (e.g., 'Who are the authors?'), "
-        "provide ONLY that information. Do NOT provide high-level summaries unless explicitly asked.\n\n"
-
-        "CAPABILITIES & TOOLS:\n"
-        "- 'run_shell_command': Run one or more zsh commands. Use standard macOS utilities: grep, rg, find, ls, sed, awk, cat, column, etc.\n"
-        "  * You can pass a list of 'commands' to execute multiple operations in a single turn.\n"
-        "  * EFFICIENT FILTERING: Use 'grep', 'sed', 'awk', or 'column' to extract only the necessary data locally. This is faster and prevents hitting the Context Guard's truncation limits.\n"
-        "- 'read_file': Read text OR PDF files. \n"
-        "  * You can pass a list of 'filepaths' to read multiple files at once.\n"
-        "  * Use 'offset' and 'limit' (lines) for text files to avoid context overload.\n"
-        "  * Use 'tail' (int) to read the last N lines/pages. This is great for logs or the end of documents.\n"
-        "  * Use 'pages' (list of ints) for PDFs. For metadata, usually only Page 1 is needed.\n"
-        "  * WARNING: Large outputs will be automatically truncated. Use segmentation to read long files.\n"
-        "- 'write_file': Save results or summaries to a file.\n"
-        "- 'get_model_info': Inspect local model details (context limit, etc.) if needed.\n"
-        "- 'request_clarification': If you are stuck because the user's request is ambiguous or missing info, "
-        "use this to ask the user a specific question. This will pause your execution.\n\n"
-        
-        "CONSTRAINTS:\n"
-        "- Stay focused on the task.\n"
-        "- If you are stuck after several attempts, report the specific technical blocker.\n"
-        "- When finished, provide the specific answer requested.\n"
-        "- Anonymize PII (Personally Identifiable Information) in your final response unless the user explicitly requested that specific data.\n\n"
-    )
-
-    if use_plan:
-        execution_instructions = (
-            "OPERATING MODE: PLAN EXECUTION\n"
-            "You are executing a pre-defined plan. The current plan status will be provided to you every turn.\n"
-            "YOUR JOB:\n"
-            "1. Review the 'CURRENT PLAN STATE'.\n"
-            "2. Execute the next unchecked step ([ ]).\n"
-            "3. VERY IMPORTANT: After finishing the work for a step, you MUST call 'complete_plan_step' to mark it as [x].\n"
-            "   - You MUST pass the 1-based index of the step you just completed.\n"
-            "   - Do NOT try to edit the plan file manually using 'write_file'. Use 'complete_plan_step'.\n"
-            "4. Do not deviate from the plan."
-        )
-        system_msg = base_system_msg + execution_instructions
-    else:
-        system_msg = base_system_msg + (
-            "OPERATING MODE: DIRECT EXECUTION\n"
-            "You MUST solve tasks iteratively using a 'Think-Act-Observe' cycle:\n"
-            "1. THOUGHT: First, explain your reasoning and plan in the text response.\n"
-            "2. ACTION: Then, call exactly ONE tool to execute a step of your plan.\n"
-            "3. OBSERVATION: Review the tool's output. If it failed, diagnose why and try a different approach.\n\n"
-        )
-    
-    messages = [{'role': 'system', 'content': system_msg}, {'role': 'user', 'content': prompt}]
-    if local_file_context:
-        ctx_msg = f"Available files: {', '.join(local_file_context)}."
-        messages.insert(1, {'role': 'system', 'content': ctx_msg})
-
-    turn_count = 0
-    has_reflected = False
-    plan_nudge_count = 0
-    last_tool_was_work = False
-    
     try:
+        # --- PHASE 1: FORCED PLANNING (If enabled) ---
+        if use_plan:
+            logger.info("Local Agent: Entering Planning Phase...")
+            
+            # 1. Clear old plan
+            if os.path.exists(PLAN_FILE):
+                os.remove(PLAN_FILE)
+                
+            # 2. Planning Loop
+            plan_system_msg = (
+                "You are a Senior Technical Planner. Your goal is to create a detailed, step-by-step implementation plan "
+                "for the user's request. To create a grounded and accurate plan, you should first explore the project "
+                "using 'run_shell_command' (e.g., 'ls -R', 'grep') and 'read_file'.\n\n"
+                f"Once you understand the context, you MUST call the 'write_file' tool to save your plan to the EXACT path: '{PLAN_FILE}'.\n"
+                "Format your plan as a Markdown checklist:\n"
+                "- [ ] Step 1: <Description>\n"
+                "- [ ] Step 2: <Description>\n\n"
+                "Do NOT execute implementation steps yet. Only use discovery tools to inform your plan. "
+                "After writing the plan file, stop."
+            )
+            
+            plan_messages = [{'role': 'system', 'content': plan_system_msg}, {'role': 'user', 'content': prompt}]
+            
+            plan_created = False
+            attempted_paths = []
+            planning_tools = [t for t in tools if t['function']['name'] in ['write_file', 'read_file', 'run_shell_command', 'request_clarification']]
+
+            for i in range(10): # Max 10 turns to explore + write a plan
+                logger.info(f"Planning Turn {i+1}/10")
+                response = await client.chat(
+                    model=model, 
+                    messages=plan_messages, 
+                    tools=planning_tools,
+                    options={'num_ctx': num_ctx}
+                )
+                msg = response.get('message', {})
+                logger.info(f"Planning Response: {msg}")
+                plan_messages.append(msg)
+                
+                tool_calls = msg.get('tool_calls')
+                if not tool_calls:
+                    if plan_created:
+                        break
+                    else:
+                        plan_messages.append({'role': 'system', 'content': f"You must write the plan to '{PLAN_FILE}' using 'write_file' before finishing."})
+                        continue
+
+                for tc in tool_calls:
+                    func_name = tc['function']['name']
+                    args = json.loads(tc['function']['arguments']) if isinstance(tc['function']['arguments'], str) else tc['function']['arguments']
+                    
+                    result = await execute_tool(func_name, args)
+                    plan_messages.append({'role': 'tool', 'content': result, 'name': func_name})
+                    
+                    if result.startswith("CLARIFICATION_REQUIRED:"):
+                        return result
+
+                    if func_name == "write_file":
+                        fp = args.get('filepath', "")
+                        attempted_paths.append(fp)
+                        if fp.endswith("local_plan.md"):
+                            plan_created = True
+                
+                if plan_created and not any(tc['function']['name'] != 'write_file' for tc in tool_calls):
+                    # If we just wrote the plan and didn't do anything else, we might be done
+                    pass 
+
+            if not plan_created:
+                return f"Error: Agent failed to generate a plan file ({PLAN_FILE}) in Planning Mode. Attempted paths: {attempted_paths}"
+            
+            logger.info("Local Agent: Plan created. Entering Execution Phase.")
+
+        # --- PHASE 2: EXECUTION LOOP (Main) ---
+        
+        base_system_msg = (
+            "IDENTITY & CONTEXT:\n"
+            "You are the 'Local Assistant', a secure autonomous reasoning agent running on the user's computer. "
+            "You act as the local 'hands' for a Cloud-based Brain (Gemini). You process sensitive data "
+            "locally to ensure privacy. You have access to the current project directory.\n\n"
+            
+            f"{model_ctx_msg}"
+            "PRIORITY 1: PRECISION & ADHERENCE\n"
+            "Always prioritize the user's specific request. If the user asks for extraction (e.g., 'Who are the authors?'), "
+            "provide ONLY that information. Do NOT provide high-level summaries unless explicitly asked.\n\n"
+
+            "CAPABILITIES & TOOLS:\n"
+            "- 'run_shell_command': Run one or more zsh commands. Use standard macOS utilities: grep, rg, find, ls, sed, awk, cat, column, etc.\n"
+            "  * You can pass a list of 'commands' to execute multiple operations in a single turn.\n"
+            "  * EFFICIENT FILTERING: Use 'grep', 'sed', 'awk', or 'column' to extract only the necessary data locally. This is faster and prevents hitting the Context Guard's truncation limits.\n"
+            "- 'read_file': Read text OR PDF files. \n"
+            "  * You can pass a list of 'filepaths' to read multiple files at once.\n"
+            "  * Use 'offset' and 'limit' (lines) for text files to avoid context overload.\n"
+            "  * Use 'tail' (int) to read the last N lines/pages. This is great for logs or the end of documents.\n"
+            "  * Use 'pages' (list of ints) for PDFs. For metadata, usually only Page 1 is needed.\n"
+            "  * WARNING: Large outputs will be automatically truncated. Use segmentation to read long files.\n"
+            "- 'write_file': Save results or summaries to a file.\n"
+            "- 'get_model_info': Inspect local model details (context limit, etc.) if needed.\n"
+            "- 'request_clarification': If you are stuck because the user's request is ambiguous or missing info, "
+            "use this to ask the user a specific question. This will pause your execution.\n\n"
+            
+            "CONSTRAINTS:\n"
+            "- Stay focused on the task.\n"
+            "- If you are stuck after several attempts, report the specific technical blocker.\n"
+            "- When finished, provide the specific answer requested.\n"
+            "- Anonymize PII (Personally Identifiable Information) in your final response unless the user explicitly requested that specific data.\n\n"
+        )
+
+        if use_plan:
+            execution_instructions = (
+                "OPERATING MODE: PLAN EXECUTION\n"
+                "You are executing a pre-defined plan. The current plan status will be provided to you every turn.\n"
+                "YOUR JOB:\n"
+                "1. Review the 'CURRENT PLAN STATE'.\n"
+                "2. Execute the next unchecked step ([ ]).\n"
+                "3. VERY IMPORTANT: After finishing the work for a step, you MUST call 'complete_plan_step' to mark it as [x].\n"
+                "   - You MUST pass the 1-based index of the step you just completed.\n"
+                "   - Do NOT try to edit the plan file manually using 'write_file'. Use 'complete_plan_step'.\n"
+                "4. Do not deviate from the plan."
+            )
+            system_msg = base_system_msg + execution_instructions
+        else:
+            system_msg = base_system_msg + (
+                "OPERATING MODE: DIRECT EXECUTION\n"
+                "You MUST solve tasks iteratively using a 'Think-Act-Observe' cycle:\n"
+                "1. THOUGHT: First, explain your reasoning and plan in the text response.\n"
+                "2. ACTION: Then, call exactly ONE tool to execute a step of your plan.\n"
+                "3. OBSERVATION: Review the tool's output. If it failed, diagnose why and try a different approach.\n\n"
+            )
+        
+        messages = [{'role': 'system', 'content': system_msg}, {'role': 'user', 'content': prompt}]
+        if local_file_context:
+            ctx_msg = f"Available files: {', '.join(local_file_context)}."
+            messages.insert(1, {'role': 'system', 'content': ctx_msg})
+
+        turn_count = 0
+        has_reflected = False
+        plan_nudge_count = 0
+        last_tool_was_work = False
+        
         while turn_count < MAX_TURNS:
             turn_count += 1
             remaining = MAX_TURNS - turn_count
@@ -552,7 +586,7 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
             
             current_messages = messages + [{'role': 'system', 'content': loop_system_msg}]
             
-            response = ollama.chat(
+            response = await client.chat(
                 model=model, 
                 messages=current_messages, 
                 tools=tools,
@@ -578,7 +612,7 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
                     
                     try:
                         # Force JSON mode for the reflection
-                        ref_response = ollama.chat(
+                        ref_response = await client.chat(
                             model=model, 
                             messages=reflection_messages, 
                             format='json',
@@ -680,12 +714,18 @@ async def ask_local_assistant(prompt: str, local_file_context: list[str] = None,
                     return result
         
         return f"Local Agent reached the maximum turn limit ({MAX_TURNS}) without finishing the task."
-        
+
+    except asyncio.CancelledError:
+        logger.info("ask_local_assistant was cancelled. Cleaning up...")
+        cleanup_resources()
+        raise
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
         logger.error(f"Local Agent Error: {e}\n{error_trace}")
         return f"Error in local agent: {str(e)}"
+    finally:
+        cleanup_resources()
 
 @mcp.tool()
 async def run_shell_command(command: str) -> str:
@@ -696,18 +736,35 @@ async def run_shell_command(command: str) -> str:
     logger.info(f"Executing command: {command}")
     
     try:
-        result = subprocess.run(
-            ["zsh", "-c", command],
-            capture_output=True,
-            text=True,
-            timeout=30 # Safety timeout
+        # Create subprocess in the current event loop
+        process = await asyncio.create_subprocess_exec(
+            "zsh", "-c", command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
-        output = f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
-        if result.returncode != 0:
-            output += f"\nReturn Code: {result.returncode}"
-        return output
-    except subprocess.TimeoutExpired:
-        return "Error: Command timed out after 30 seconds."
+        active_subprocesses.add(process)
+        
+        try:
+            # Use asyncio.wait_for for timeout
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30.0)
+            output = f"STDOUT:\n{stdout.decode()}\nSTDERR:\n{stderr.decode()}"
+            if process.returncode != 0:
+                output += f"\nReturn Code: {process.returncode}"
+            return output
+        except asyncio.TimeoutError:
+            process.terminate()
+            await process.wait()
+            return "Error: Command timed out after 30 seconds."
+        finally:
+            active_subprocesses.discard(process)
+            
+    except asyncio.CancelledError:
+        logger.info(f"Shell command cancelled: {command}")
+        # Terminate process if cancelled
+        for p in list(active_subprocesses):
+            if p.returncode is None:
+                p.terminate()
+        raise
     except Exception as e:
         logger.error(f"Execution Error: {e}")
         return f"Error executing command: {str(e)}"

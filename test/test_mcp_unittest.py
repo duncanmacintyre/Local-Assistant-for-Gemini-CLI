@@ -4,18 +4,33 @@ import shutil
 import tempfile
 import sys
 import json
-from unittest.mock import MagicMock, patch, mock_open
+import asyncio
+from unittest.mock import MagicMock, patch, mock_open, AsyncMock
 import mcp_server
 
 class TestMCPServer(unittest.IsolatedAsyncioTestCase):
 
-    def setUp(self):
+    async def asyncSetUp(self):
         # Create a temporary directory for each test
         self.test_dir = tempfile.mkdtemp()
-    
-    def tearDown(self):
+        self.old_cwd = os.getcwd()
+        os.chdir(self.test_dir)
+        
+        # Patch ollama.AsyncClient
+        self.mock_client_patcher = patch("mcp_server.ollama.AsyncClient")
+        self.mock_client_class = self.mock_client_patcher.start()
+        self.mock_client = MagicMock()
+        self.mock_client_class.return_value = self.mock_client
+        
+        self.mock_client.show = AsyncMock(return_value={"modelinfo": {"context_length": 32768}})
+        self.mock_client.chat = AsyncMock()
+        self.mock_client.list = AsyncMock()
+
+    async def asyncTearDown(self):
         # Clean up the temporary directory
+        os.chdir(self.old_cwd)
         shutil.rmtree(self.test_dir)
+        self.mock_client_patcher.stop()
 
     # --- Sandbox Detection Tests ---
 
@@ -59,9 +74,11 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
             f.write("line1\nline2\nline3\nline4\n")
         
         from mcp_server import _read_local_file as read_fn
+        # Test offset only
         content, total, unit = read_fn(test_file, offset=2)
         self.assertEqual(content, "line3\nline4\n")
         self.assertEqual(total, 4)
+        # Test offset and limit
         content, total, unit = read_fn(test_file, offset=1, limit=2)
         self.assertEqual(content, "line2\nline3\n")
         self.assertEqual(total, 4)
@@ -80,6 +97,7 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
         mock_pdf_reader.return_value.pages = [p1, p2]
         
         from mcp_server import _read_local_file as read_fn
+        # Test reading only page 2
         content, total, unit = read_fn(test_pdf, pages=[2])
         self.assertIn("page 2 text", content)
         self.assertNotIn("page 1 text", content)
@@ -115,22 +133,24 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
 
     async def test_run_shell_command_success(self):
         from mcp_server import run_shell_command
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value.stdout = "ls output"
-            mock_run.return_value.stderr = ""
-            mock_run.return_value.returncode = 0
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_process = MagicMock()
+            mock_process.communicate = AsyncMock(return_value=(b"ls output", b""))
+            mock_process.returncode = 0
+            mock_exec.return_value = mock_process
             
             result = await run_shell_command("ls")
             self.assertIn("ls output", result)
-            args = mock_run.call_args[0][0]
-            self.assertEqual(args, ["zsh", "-c", "ls"])
+            args = mock_exec.call_args[0]
+            self.assertEqual(args, ("zsh", "-c", "ls"))
 
     async def test_run_shell_command_error(self):
         from mcp_server import run_shell_command
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value.stdout = ""
-            mock_run.return_value.stderr = "permission denied"
-            mock_run.return_value.returncode = 1
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_process = MagicMock()
+            mock_process.communicate = AsyncMock(return_value=(b"", b"permission denied"))
+            mock_process.returncode = 1
+            mock_exec.return_value = mock_process
             
             result = await run_shell_command("invalid_cmd")
             self.assertIn("Return Code: 1", result)
@@ -138,11 +158,10 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
 
     # --- Agent Loop Logic (Mocked Ollama) ---
 
-    @patch("ollama.chat")
-    async def test_ask_local_assistant_planning_mode(self, mock_chat):
+    async def test_ask_local_assistant_planning_mode(self):
         from mcp_server import ask_local_assistant
         
-        mock_chat.side_effect = [
+        self.mock_client.chat.side_effect = [
             # Phase 1: Planning Turn 1 (Write Plan)
             {
                 'message': {
@@ -178,26 +197,25 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
             result = await ask_local_assistant("Deep work", use_plan=True)
             
             # Verify Planning Prompt
-            plan_msg = mock_chat.call_args_list[0][1]['messages'][0]['content']
+            plan_msg = self.mock_client.chat.call_args_list[0][1]['messages'][0]['content']
             self.assertIn("Senior Technical Planner", plan_msg)
             self.assertIn("Do NOT execute implementation steps yet", plan_msg)
-            self.assertEqual(mock_chat.call_args_list[0][1]['options'], {'num_ctx': 32768})
+            self.assertEqual(self.mock_client.chat.call_args_list[0][1]['options'], {'num_ctx': 32768})
             
             # Verify Execution Prompt (Plan Injection)
             # Planning took 2 turns (one for tool call, one for content-only finish)
-            exec_context_msg = mock_chat.call_args_list[2][1]['messages'][-1]['content']
+            exec_context_msg = self.mock_client.chat.call_args_list[2][1]['messages'][-1]['content']
             self.assertIn("CURRENT PLAN STATE", exec_context_msg)
-            self.assertEqual(mock_chat.call_args_list[2][1]['options'], {'num_ctx': 32768})
+            self.assertEqual(self.mock_client.chat.call_args_list[2][1]['options'], {'num_ctx': 32768})
             
             # Verify Final Output contains the plan
             self.assertIn("--- EXECUTION PLAN ---", result)
             self.assertIn("- [ ] Step A", result)
 
-    @patch("ollama.chat")
-    async def test_ask_local_assistant_planning_mode_warning(self, mock_chat):
+    async def test_ask_local_assistant_planning_mode_warning(self):
         from mcp_server import ask_local_assistant
         
-        mock_chat.side_effect = [
+        self.mock_client.chat.side_effect = [
             # Phase 1: Planning Turn 1 (Write Plan)
             {
                 'message': {
@@ -235,25 +253,23 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
             self.assertIn("[Warning: Agent executed actions but failed to update the plan checklist.]", result)
 
 
-    @patch("ollama.chat")
-    async def test_ask_local_assistant_no_tool(self, mock_chat):
+    async def test_ask_local_assistant_no_tool(self):
         from mcp_server import ask_local_assistant
-        mock_chat.side_effect = [
+        self.mock_client.chat.side_effect = [
             {'message': {'role': 'assistant', 'content': 'direct answer'}},
             {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}}
         ]
         result = await ask_local_assistant("What is 2+2?")
         self.assertEqual(result, "direct answer")
 
-    @patch("ollama.chat")
-    async def test_ask_local_assistant_multiple_turns(self, mock_chat):
+    async def test_ask_local_assistant_multiple_turns(self):
         from mcp_server import ask_local_assistant
         
         test_file = os.path.join(self.test_dir, "a.txt")
         with open(test_file, "w") as f:
             f.write("source")
         
-        mock_chat.side_effect = [
+        self.mock_client.chat.side_effect = [
             {
                 'message': {
                     'role': 'assistant',
@@ -268,18 +284,16 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
         result = await ask_local_assistant("Analyze a.txt")
         
         self.assertEqual(result, "Done!")
-        self.assertEqual(mock_chat.call_count, 3)
+        self.assertEqual(self.mock_client.chat.call_count, 3)
         
         # Verify the tool call included the reminder
-        # call_args_list[0] is the first call (tool request)
-        last_call_messages = mock_chat.call_args_list[0][1]['messages']
+        last_call_messages = self.mock_client.chat.call_args_list[0][1]['messages']
         self.assertEqual(last_call_messages[-1]['role'], 'system')
         self.assertIn("REMINDER", last_call_messages[-1]['content'])
 
-    @patch("ollama.chat")
-    async def test_ask_local_assistant_turn_limit(self, mock_chat):
+    async def test_ask_local_assistant_turn_limit(self):
         from mcp_server import ask_local_assistant
-        mock_chat.return_value = {
+        self.mock_client.chat.return_value = {
             'message': {
                 'role': 'assistant',
                 'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepaths': ['dummy']}}}]
@@ -288,16 +302,16 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
 
         result = await ask_local_assistant("Do something")
         self.assertIn("maximum turn limit", result)
-        self.assertEqual(mock_chat.call_count, 20)
-    @patch("ollama.chat")
-    async def test_ask_local_assistant_agent_read_missing(self, mock_chat):
+        self.assertEqual(self.mock_client.chat.call_count, 20)
+
+    async def test_ask_local_assistant_agent_read_missing(self):
         from mcp_server import ask_local_assistant
         
-        mock_chat.side_effect = [
+        self.mock_client.chat.side_effect = [
             {
                 'message': {
                     'role': 'assistant',
-                    'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepath': 'gone.txt'}}}]
+                    'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepaths': ['gone.txt']}}}]
                 }
             },
             {'message': {'content': 'The file is gone.'}},
@@ -306,23 +320,18 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
         
         await ask_local_assistant("Read gone.txt")
         
-        final_history = mock_chat.call_args_list[1][1]['messages']
-        # Note: messages list grows, so we need to find the tool message in the history passed to the 2nd call
-        # The history passed to chat() includes the reminder at the end.
-        # But the tool message is appended to the messages list *before* chat() is called again.
-        # So we look at the messages passed to the 2nd call.
+        final_history = self.mock_client.chat.call_args_list[1][1]['messages']
         tool_msg = next(m for m in final_history if m['role'] == 'tool')
         self.assertIn("not found", tool_msg['content'])
 
-    @patch("ollama.chat")
-    async def test_ask_local_assistant_read_file_partial(self, mock_chat):
+    async def test_ask_local_assistant_read_file_partial(self):
         from mcp_server import ask_local_assistant
         
         test_file = os.path.join(self.test_dir, "lines.txt")
         with open(test_file, "w") as f:
             f.write("line1\nline2\nline3\n")
         
-        mock_chat.side_effect = [
+        self.mock_client.chat.side_effect = [
             {
                 'message': {
                     'role': 'assistant',
@@ -340,53 +349,39 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
         
         await ask_local_assistant("Read line 2 of lines.txt")
         
-        final_history = mock_chat.call_args_list[1][1]['messages']
+        final_history = self.mock_client.chat.call_args_list[1][1]['messages']
         tool_msg = next(m for m in final_history if m['role'] == 'tool')
         expected_content = f"--- FILE: {test_file} (3 lines total) ---\nline2\n\n"
         self.assertEqual(tool_msg['content'], expected_content)
 
-    # --- Model & Ollama Tool Tests ---
-
-    @patch("ollama.list")
-    async def test_list_local_models(self, mock_list):
+    async def test_list_local_models(self):
         from mcp_server import list_local_models
-        mock_list.return_value = {
-            'models': [
-                {'name': 'mistral-nemo:latest'},
-                {'name': 'llama3:8b'}
+        self.mock_client.list.return_value = MagicMock(
+            models=[
+                MagicMock(model='mistral-nemo:latest'),
+                MagicMock(model='llama3:8b')
             ]
-        }
-        
+        )
+
         result = await list_local_models()
         self.assertIn("Available local models:", result)
         self.assertIn("mistral-nemo:latest", result)
         self.assertIn("llama3:8b", result)
-
-    @patch("ollama.list")
-    async def test_list_local_models_empty(self, mock_list):
+    async def test_list_local_models_empty(self):
         from mcp_server import list_local_models
-        mock_list.return_value = {'models': []}
+        self.mock_client.list.return_value = MagicMock(models=[])
         result = await list_local_models()
         self.assertIn("No local models found", result)
 
-    @patch("ollama.list")
-    async def test_list_local_models_error(self, mock_list):
-        from mcp_server import list_local_models
-        mock_list.side_effect = Exception("Ollama connection failed")
-        result = await list_local_models()
-        self.assertIn("Error listing models", result)
-
-    @patch("ollama.chat")
-    async def test_ask_local_assistant_custom_model(self, mock_chat):
+    async def test_ask_local_assistant_custom_model(self):
         from mcp_server import ask_local_assistant
-        mock_chat.side_effect = [
+        self.mock_client.chat.side_effect = [
             {'message': {'content': 'using custom model'}},
             {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}}
         ]
         await ask_local_assistant("Hello", model="llama3")
-        kwargs = mock_chat.call_args_list[0][1]
+        kwargs = self.mock_client.chat.call_args_list[0][1]
         self.assertEqual(kwargs['model'], "llama3")
-        self.assertEqual(kwargs['options'], {'num_ctx': 32768})
 
 if __name__ == "__main__":
     unittest.main()

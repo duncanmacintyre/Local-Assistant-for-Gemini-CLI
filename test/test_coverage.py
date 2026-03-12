@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+import asyncio
 from unittest.mock import MagicMock, patch, AsyncMock
 
 # Add current directory to sys.path
@@ -9,6 +10,11 @@ sys.path.append(os.getcwd())
 # --- MOCKING DEPENDENCIES ---
 # We mock these BEFORE importing mcp_server because they are imported at the top level
 sys.modules["ollama"] = MagicMock()
+mock_async_client = MagicMock()
+sys.modules["ollama"].AsyncClient.return_value = mock_async_client
+mock_async_client.chat = AsyncMock()
+mock_async_client.list = AsyncMock()
+mock_async_client.show = AsyncMock()
 sys.modules["pypdf"] = MagicMock()
 
 # Mock FastMCP so its .tool() decorator returns the original function
@@ -28,12 +34,15 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         # Reset mocks
-        sys.modules["ollama"].chat.reset_mock(side_effect=True, return_value=True)
-        sys.modules["ollama"].list.reset_mock(side_effect=True, return_value=True)
-        sys.modules["ollama"].chat.side_effect = None
-        sys.modules["ollama"].chat.return_value = None
-        sys.modules["ollama"].list.side_effect = None
-        sys.modules["ollama"].list.return_value = None
+        mock_async_client.chat.reset_mock(side_effect=True, return_value=True)
+        mock_async_client.list.reset_mock(side_effect=True, return_value=True)
+        mock_async_client.show.reset_mock(side_effect=True, return_value=True)
+        mock_async_client.chat.side_effect = None
+        mock_async_client.chat.return_value = None
+        mock_async_client.list.side_effect = None
+        mock_async_client.list.return_value = None
+        mock_async_client.show.side_effect = None
+        mock_async_client.show.return_value = {"modelinfo": {"context_length": 32768}}
 
     # --- Sandbox Detection Tests ---
 
@@ -98,20 +107,26 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
     # --- Tool Execution Tests ---
 
     async def test_run_shell_command_success(self):
-        mock_result = MagicMock()
-        mock_result.stdout = "out"
-        mock_result.stderr = "err"
-        mock_result.returncode = 0
-        
-        with patch("subprocess.run", return_value=mock_result):
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_process = MagicMock()
+            mock_process.communicate = AsyncMock(return_value=(b"out", b"err"))
+            mock_process.returncode = 0
+            mock_exec.return_value = mock_process
+            
             result = await mcp_server.run_shell_command("ls")
             self.assertIn("STDOUT:\nout", result)
 
     async def test_run_shell_command_timeout(self):
-        import subprocess
-        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="ls", timeout=30)):
-            result = await mcp_server.run_shell_command("ls")
-            self.assertIn("timed out", result)
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            mock_process = MagicMock()
+            mock_process.communicate = AsyncMock()
+            mock_process.terminate = MagicMock()
+            mock_process.wait = AsyncMock()
+            mock_exec.return_value = mock_process
+            # Since we use asyncio.wait_for in mcp_server.py
+            with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError()):
+                result = await mcp_server.run_shell_command("ls")
+                self.assertIn("timed out", result)
 
     async def test_write_file_success(self):
         with patch("os.makedirs"):
@@ -127,7 +142,7 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
     # --- Agent Loop Logic ---
 
     async def test_ask_local_assistant_no_tool(self):
-        sys.modules["ollama"].chat.return_value = {
+        mock_async_client.chat.return_value = {
             'message': {'role': 'assistant', 'content': 'hello'}
         }
         result = await mcp_server.ask_local_assistant("hi")
@@ -135,7 +150,7 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
 
     async def test_ask_local_assistant_all_tools(self):
         # Mocking Turn 1: log_thought, Turn 2: read_file, Turn 3: write_file, Turn 4: run_shell_command, Turn 5: Finish
-        sys.modules["ollama"].chat.side_effect = [
+        mock_async_client.chat.side_effect = [
             {'message': {'role': 'assistant', 'tool_calls': [{'function': {'name': 'log_thought', 'arguments': {'thought': 't'}}}]}},
             {'message': {'role': 'assistant', 'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepath': 'f.txt'}}}]}},
             {'message': {'role': 'assistant', 'tool_calls': [{'function': {'name': 'write_file', 'arguments': {'filepath': 'w.txt', 'content': 'c'}}}]}},
@@ -150,11 +165,11 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
                     with patch("mcp_server.get_model_info", new_callable=AsyncMock, return_value='{"context_length": 32000}'):
                         result = await mcp_server.ask_local_assistant("hi")
                         self.assertEqual(result, "Done")
-                    self.assertEqual(sys.modules["ollama"].chat.call_count, 6)
+                    self.assertEqual(mock_async_client.chat.call_count, 6)
 
     async def test_ask_local_assistant_turn_limit(self):
         # Always return a tool call to hit the turn limit
-        sys.modules["ollama"].chat.return_value = {
+        mock_async_client.chat.return_value = {
             'message': {'role': 'assistant', 'tool_calls': [{'function': {'name': 'log_thought', 'arguments': {'thought': 'Thinking'}}}]}
         }
         result = await mcp_server.ask_local_assistant("hi")
@@ -163,10 +178,10 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
     # --- Tool Wrapper Tests ---
 
     async def test_read_file_tool(self):
-        with patch("mcp_server._read_local_file", return_value="content"):
+        with patch("mcp_server._read_local_file", return_value=("content", 1, "lines")):
             with patch("os.path.exists", return_value=True):
                 result = await mcp_server.read_file("f.txt")
-                self.assertEqual(result, "content")
+                self.assertIn("content", result)
 
     async def test_read_file_tool_missing(self):
         with patch("os.path.exists", return_value=False):
@@ -174,27 +189,27 @@ class TestMCPServer(unittest.IsolatedAsyncioTestCase):
             self.assertIn("not found", result)
 
     async def test_ask_local_assistant_error(self):
-        sys.modules["ollama"].chat.side_effect = Exception("Ollama Down")
+        mock_async_client.chat.side_effect = Exception("Ollama Down")
         result = await mcp_server.ask_local_assistant("hi")
         self.assertIn("Error in local agent", result)
 
     # --- Model Listing ---
 
     async def test_list_local_models_success(self):
-        sys.modules["ollama"].list.return_value = {
-            'models': [{'name': 'm1'}, {'name': 'm2'}]
-        }
+        mock_async_client.list.return_value = MagicMock(
+            models=[MagicMock(model='m1'), MagicMock(model='m2')]
+        )
         result = await mcp_server.list_local_models()
         self.assertIn("m1", result)
         self.assertIn("m2", result)
 
     async def test_list_local_models_empty(self):
-        sys.modules["ollama"].list.return_value = {'models': []}
+        mock_async_client.list.return_value = MagicMock(models=[])
         result = await mcp_server.list_local_models()
         self.assertIn("No local models found", result)
 
     async def test_list_local_models_error(self):
-        sys.modules["ollama"].list.side_effect = Exception("Failed")
+        mock_async_client.list.side_effect = Exception("Failed")
         result = await mcp_server.list_local_models()
         self.assertIn("Error listing models", result)
 

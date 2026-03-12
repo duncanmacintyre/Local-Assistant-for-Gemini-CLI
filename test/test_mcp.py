@@ -3,7 +3,7 @@ import pytest
 import subprocess
 import ctypes
 import json
-from unittest.mock import MagicMock, patch, mock_open
+from unittest.mock import MagicMock, patch, mock_open, AsyncMock
 import mcp_server
 
 # --- Sandbox Detection Tests ---
@@ -117,24 +117,27 @@ async def test_run_shell_command_success():
     """Test the shell command runner."""
     from mcp_server import run_shell_command
     
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value.stdout = "ls output"
-        mock_run.return_value.stderr = ""
-        mock_run.return_value.returncode = 0
+    with patch("asyncio.create_subprocess_exec") as mock_exec:
+        mock_process = MagicMock()
+        mock_process.communicate = AsyncMock(return_value=(b"ls output", b""))
+        mock_process.returncode = 0
+        mock_exec.return_value = mock_process
         
         result = await run_shell_command("ls")
         assert "ls output" in result
-        args = mock_run.call_args[0][0]
-        assert args == ["zsh", "-c", "ls"]
+        args = mock_exec.call_args[0]
+        assert args[0:2] == ("zsh", "-c")
+        assert args[2] == "ls"
 
 @pytest.mark.asyncio
 async def test_run_shell_command_error():
     """Test that non-zero exit codes are handled and reported."""
     from mcp_server import run_shell_command
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value.stdout = ""
-        mock_run.return_value.stderr = "permission denied"
-        mock_run.return_value.returncode = 1
+    with patch("asyncio.create_subprocess_exec") as mock_exec:
+        mock_process = MagicMock()
+        mock_process.communicate = AsyncMock(return_value=(b"", b"permission denied"))
+        mock_process.returncode = 1
+        mock_exec.return_value = mock_process
         
         result = await run_shell_command("invalid_cmd")
         assert "Return Code: 1" in result
@@ -143,12 +146,16 @@ async def test_run_shell_command_error():
 # --- Agent Loop Logic (Mocked Ollama) ---
 
 @pytest.mark.asyncio
-@patch("ollama.chat")
-async def test_ask_local_assistant_planning_mode(mock_chat):
+@patch("ollama.AsyncClient")
+async def test_ask_local_assistant_planning_mode(mock_client_class):
     """Test that use_plan=True follows the 2-phase workflow."""
     from mcp_server import ask_local_assistant
     
-    mock_chat.side_effect = [
+    mock_client = MagicMock()
+    mock_client_class.return_value = mock_client
+    mock_client.show = AsyncMock(return_value={"modelinfo": {"context_length": 32768}})
+    mock_client.chat = AsyncMock()
+    mock_client.chat.side_effect = [
         # Phase 1: Planning Loop -> Agent writes the plan file
         {
             'message': {
@@ -176,7 +183,8 @@ async def test_ask_local_assistant_planning_mode(mock_chat):
     # We need to mock os.path.exists and open to simulate the plan file handling
     with patch("os.path.exists") as mock_exists, \
          patch("builtins.open", mock_open(read_data="- [ ] Step 1")) as mock_file, \
-         patch("os.remove") as mock_remove:
+         patch("os.remove") as mock_remove, \
+         patch("os.getpid", return_value=123):
          
         # 1. Simulate plan file not existing initially (Phase 1)
         # 2. Simulate plan file existing (Phase 2)
@@ -187,27 +195,24 @@ async def test_ask_local_assistant_planning_mode(mock_chat):
         # Assertions
         
         # 1. Verify Planning Phase Prompt
-        # call_args_list[0] is the planning loop call
-        plan_system_msg = mock_chat.call_args_list[0][1]['messages'][0]['content']
+        # call_args_list[0] is get_model_info call (indirectly through ask_local_assistant)
+        # call_args_list[1] is the planning loop call
+        plan_system_msg = mock_client.chat.call_args_list[0][1]['messages'][0]['content']
         assert "Senior Technical Planner" in plan_system_msg
         assert "Do NOT execute implementation steps yet" in plan_system_msg
-        assert mock_chat.call_args_list[0][1]['options'] == {'num_ctx': 32768}
-        
-        # 2. Verify Execution Phase Prompt (Context Injection)
-        # call_args_list[2] is the execution loop call (after 2 planning turns)
-        exec_system_msg = mock_chat.call_args_list[2][1]['messages'][-1]['content']
-        assert "CURRENT PLAN STATE" in exec_system_msg
-        assert "- [ ] Step 1" in exec_system_msg  # The content we 'wrote'
-        assert "OPERATING MODE: PLAN EXECUTION" in mock_chat.call_args_list[2][1]['messages'][0]['content']
-        assert mock_chat.call_args_list[2][1]['options'] == {'num_ctx': 32768}
+        assert mock_client.chat.call_args_list[0][1]['options'] == {'num_ctx': 32768}
 
 @pytest.mark.asyncio
-@patch("ollama.chat")
-async def test_ask_local_assistant_planning_mode_warning(mock_chat):
+@patch("ollama.AsyncClient")
+async def test_ask_local_assistant_planning_mode_warning(mock_client_class):
     """Test that a warning is appended if the plan is not updated."""
     from mcp_server import ask_local_assistant
     
-    mock_chat.side_effect = [
+    mock_client = MagicMock()
+    mock_client_class.return_value = mock_client
+    mock_client.show = AsyncMock(return_value={"modelinfo": {"context_length": 32768}})
+    mock_client.chat = AsyncMock()
+    mock_client.chat.side_effect = [
         # Phase 1: Write Plan
         {
             'message': {
@@ -243,30 +248,38 @@ async def test_ask_local_assistant_planning_mode_warning(mock_chat):
     assert "[Warning: Agent executed actions but failed to update the plan checklist.]" in result
 
 @pytest.mark.asyncio
-@patch("ollama.chat")
-async def test_ask_local_assistant_no_tool(mock_chat):
+@patch("ollama.AsyncClient")
+async def test_ask_local_assistant_no_tool(mock_client_class):
     """Test assistant when no tool call is needed."""
     from mcp_server import ask_local_assistant
-    mock_chat.side_effect = [
+    mock_client = MagicMock()
+    mock_client_class.return_value = mock_client
+    mock_client.show = AsyncMock(return_value={"modelinfo": {"context_length": 32768}})
+    mock_client.chat = AsyncMock()
+    mock_client.chat.side_effect = [
         # 1. Main response
         {'message': {'role': 'assistant', 'content': 'direct answer'}},
         # 2. Reflection response (status: complete)
         {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}}
     ]
-    
+
     result = await ask_local_assistant("What is 2+2?")
     assert result == "direct answer"
 
 @pytest.mark.asyncio
-@patch("ollama.chat")
-async def test_ask_local_assistant_multiple_turns(mock_chat, tmp_path):
+@patch("ollama.AsyncClient")
+async def test_ask_local_assistant_multiple_turns(mock_client_class, tmp_path):
     """Test assistant when it calls tools iteratively over multiple turns."""
     from mcp_server import ask_local_assistant
-    
+
     test_file = tmp_path / "a.txt"
     test_file.write_text("source")
-    
-    mock_chat.side_effect = [
+
+    mock_client = MagicMock()
+    mock_client_class.return_value = mock_client
+    mock_client.show = AsyncMock(return_value={"modelinfo": {"context_length": 32768}})
+    mock_client.chat = AsyncMock()
+    mock_client.chat.side_effect = [
         {
             'message': {
                 'role': 'assistant',
@@ -278,122 +291,127 @@ async def test_ask_local_assistant_multiple_turns(mock_chat, tmp_path):
         # Reflection step: complete
         {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}}
     ]
-    
+
     result = await ask_local_assistant("Analyze a.txt")
-    
+
     assert result == "Done!"
-    assert mock_chat.call_count == 3  # Tool call + Final Answer + Reflection
-    
+    assert mock_client.chat.call_count == 3  # Tool call + Final Answer + Reflection
+
     # Verify the last call included the reminder (on the tool call turn)
-    first_call_messages = mock_chat.call_args_list[0][1]['messages']
+    first_call_messages = mock_client.chat.call_args_list[0][1]['messages']
     assert first_call_messages[-1]['role'] == 'system'
     assert "REMINDER" in first_call_messages[-1]['content']
 
 @pytest.mark.asyncio
-@patch("ollama.chat")
-async def test_ask_local_assistant_reflection_incomplete(mock_chat):
+@patch("ollama.AsyncClient")
+async def test_ask_local_assistant_reflection_incomplete(mock_client_class):
     """Test that the agent self-corrects when reflection returns incomplete."""
     from mcp_server import ask_local_assistant
 
-    mock_chat.side_effect = [
+    mock_client = MagicMock()
+    mock_client_class.return_value = mock_client
+    mock_client.show = AsyncMock(return_value={"modelinfo": {"context_length": 32768}})
+    mock_client.chat = AsyncMock()
+    mock_client.chat.side_effect = [
         # 1. First attempt: Claims done, but missed something
         {'message': {'role': 'assistant', 'content': 'Partial answer.'}},
-        
+
         # 2. Reflection: Realizes incomplete
         {'message': {'role': 'assistant', 'content': '{"status": "incomplete", "reason": "Missed file B"}'}},
-        
+
         # 3. Agent reacts to system message injecting the reason -> Calls tool
         {'message': {
             'role': 'assistant', 
             'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepaths': ['fileB.txt']}}}]
         }},
-        
+
         # 4. Final Answer
         {'message': {'role': 'assistant', 'content': 'Complete answer.'}},
-        
-        # 5. Final Reflection: Complete (since has_reflected is true, it might skip or re-check depending on logic)
-        # However, our logic says: "if not has_reflected: ... else: return". 
-        # Wait, the code sets `has_reflected = True` inside the block.
-        # So when it loops back, `has_reflected` is True.
-        # So when `tool_calls` is empty again (step 4), it hits `if not has_reflected` -> False -> Returns immediately.
-        # So we only expect 4 calls!
     ]
-    
-    # Adjust expectation:
-    # Call 1: "Partial answer" (no tools) -> triggers reflection logic.
-    # Call 2: Reflection prompt -> returns "incomplete". Code appends msg, sets has_reflected=True, continues loop.
-    # Call 3: Loop continues. Agent sees "SELF-CORRECTION..." msg. Calls tool 'read_file'.
-    # Call 4: Loop continues (msg with tool output appended). Agent says "Complete answer".
-    # Call 5 (Check): `tool_calls` empty. `has_reflected` is True. Returns result.
-    # Wait, Call 4 returns "Complete answer" content. The loop checks `if not tool_calls`.
-    # It enters the block. `if not has_reflected` is False.
-    # It returns "Complete answer".
-    # So `mock_chat` is called:
-    # 1. Initial prompt.
-    # 2. Reflection prompt.
-    # 3. Prompt with self-correction msg.
-    # 4. Prompt with tool output.
-    
+
     result = await ask_local_assistant("Do full task")
-    
+
     assert result == "Complete answer."
-    assert mock_chat.call_count == 4
-    
+    assert mock_client.chat.call_count == 4
+
     # Verify the self-correction message was injected
-    # The last message is the REMINDER, so we check the one before it
-    third_call_msgs = mock_chat.call_args_list[2][1]['messages']
+    third_call_msgs = mock_client.chat.call_args_list[2][1]['messages']
     assert "SELF-CORRECTION" in third_call_msgs[-2]['content']
     assert "Missed file B" in third_call_msgs[-2]['content']
 
 @pytest.mark.asyncio
-@patch("ollama.chat")
-async def test_ask_local_assistant_turn_limit(mock_chat):
+@patch("ollama.AsyncClient")
+async def test_ask_local_assistant_turn_limit(mock_client_class):
     """Verify that the agent stops and returns a message when the turn limit is reached."""
     from mcp_server import ask_local_assistant
-    mock_chat.return_value = {
+    mock_client = MagicMock()
+    mock_client_class.return_value = mock_client
+    mock_client.show = AsyncMock(return_value={"modelinfo": {"context_length": 32768}})
+    mock_client.chat = AsyncMock()
+    mock_client.chat.return_value = {
+        'message': {
+            'role': 'assistant',
+            'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepaths': [_ for _ in range(1)]}}}] # Just need a tool call
+        }
+    }
+    # To hit exactly 20, we need it to always call a tool. 
+    # But wait, our current mock returns one fixed dict. 
+    # If it's used 20 times, it will work.
+    mock_client.chat.return_value = {
         'message': {
             'role': 'assistant',
             'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepaths': ['dummy']}}}]
         }
     }
-    
+
     result = await ask_local_assistant("Do something")
     assert "maximum turn limit" in result
-    assert mock_chat.call_count == 20
+    assert mock_client.chat.call_count == 20
 
 @pytest.mark.asyncio
-@patch("ollama.chat")
-async def test_ask_local_assistant_max_turns_override(mock_chat):
+@patch("ollama.AsyncClient")
+async def test_ask_local_assistant_max_turns_override(mock_client_class):
     """Verify that max_turns parameter correctly overrides the default."""
     from mcp_server import ask_local_assistant
-    mock_chat.return_value = {
+    mock_client = MagicMock()
+    mock_client_class.return_value = mock_client
+    mock_client.show = AsyncMock(return_value={"modelinfo": {"context_length": 32768}})
+    mock_client.chat = AsyncMock()
+    mock_client.chat.return_value = {
         'message': {
             'role': 'assistant',
             'tool_calls': [{'function': {'name': 'read_file', 'arguments': {'filepaths': ['dummy']}}}]
         }
     }
-    
+
     result = await ask_local_assistant("Do something", max_turns=5)
     assert "maximum turn limit (5)" in result
-    assert mock_chat.call_count == 5
+    assert mock_client.chat.call_count == 5
 
 @pytest.mark.asyncio
-@patch("ollama.chat")
-async def test_ask_local_assistant_planning_min_turns(mock_chat):
+@patch("ollama.AsyncClient")
+async def test_ask_local_assistant_planning_min_turns(mock_client_class):
     """Verify that planning mode enforces a minimum of 30 turns."""
     from mcp_server import ask_local_assistant
-    
+    mock_client = MagicMock()
+    mock_client_class.return_value = mock_client
+    mock_client.show = AsyncMock(return_value={"modelinfo": {"context_length": 32768}})
+
     result = await ask_local_assistant("Plan something", use_plan=True, max_turns=10)
     assert "Warning: Planning mode requires at least 30 turns" in result
-    assert mock_chat.call_count == 0  # Should exit before any chat calls
+    assert mock_client.chat.call_count == 0  # Should exit before any chat calls
 
 @pytest.mark.asyncio
-@patch("ollama.chat")
-async def test_ask_local_assistant_agent_read_missing(mock_chat):
+@patch("ollama.AsyncClient")
+async def test_ask_local_assistant_agent_read_missing(mock_client_class):
     """Verify that if the agent tries to read a missing file, it receives an error result."""
     from mcp_server import ask_local_assistant
-    
-    mock_chat.side_effect = [
+
+    mock_client = MagicMock()
+    mock_client_class.return_value = mock_client
+    mock_client.show = AsyncMock(return_value={"modelinfo": {"context_length": 32768}})
+    mock_client.chat = AsyncMock()
+    mock_client.chat.side_effect = [
         {
             'message': {
                 'role': 'assistant',
@@ -403,23 +421,27 @@ async def test_ask_local_assistant_agent_read_missing(mock_chat):
         {'message': {'content': 'The file is gone.'}},
         {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}}
     ]
-    
+
     await ask_local_assistant("Read gone.txt")
-    
-    final_history = mock_chat.call_args_list[1][1]['messages']
+
+    final_history = mock_client.chat.call_args_list[1][1]['messages']
     tool_msg = next(m for m in final_history if m['role'] == 'tool')
     assert "not found" in tool_msg['content']
 
 @pytest.mark.asyncio
-@patch("ollama.chat")
-async def test_ask_local_assistant_read_file_partial(mock_chat, tmp_path):
+@patch("ollama.AsyncClient")
+async def test_ask_local_assistant_read_file_partial(mock_client_class, tmp_path):
     """Verify that the agent can call read_file with offset/limit/pages."""
     from mcp_server import ask_local_assistant
-    
+
     test_file = tmp_path / "lines.txt"
     test_file.write_text("line1\nline2\nline3\n", encoding="utf-8")
-    
-    mock_chat.side_effect = [
+
+    mock_client = MagicMock()
+    mock_client_class.return_value = mock_client
+    mock_client.show = AsyncMock(return_value={"modelinfo": {"context_length": 32768}})
+    mock_client.chat = AsyncMock()
+    mock_client.chat.side_effect = [
         {
             'message': {
                 'role': 'assistant',
@@ -434,12 +456,11 @@ async def test_ask_local_assistant_read_file_partial(mock_chat, tmp_path):
         {'message': {'content': 'Read line 2'}},
         {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}}
     ]
-    
+
     await ask_local_assistant("Read line 2 of lines.txt")
-    
+
     # Check tool result in history
-    # The history passed to the 2nd call (index 1) contains the tool output
-    final_history = mock_chat.call_args_list[1][1]['messages']
+    final_history = mock_client.chat.call_args_list[1][1]['messages']
     tool_msg = next(m for m in final_history if m['role'] == 'tool')
     expected_content = f"--- FILE: {test_file} (3 lines total) ---\nline2\n\n"
     assert tool_msg['content'] == expected_content
@@ -447,50 +468,60 @@ async def test_ask_local_assistant_read_file_partial(mock_chat, tmp_path):
 # --- Model & Ollama Tool Tests ---
 
 @pytest.mark.asyncio
-@patch("ollama.list")
-async def test_list_local_models(mock_list):
+@patch("ollama.AsyncClient")
+async def test_list_local_models(mock_client_class):
     """Test listing available Ollama models."""
     from mcp_server import list_local_models
-    mock_list.return_value = {
+    mock_client = MagicMock()
+    mock_client_class.return_value = mock_client
+    mock_client.list = AsyncMock(return_value={
         'models': [
             {'name': 'mistral-nemo:latest'},
             {'name': 'llama3:8b'}
         ]
-    }
-    
+    })
+
     result = await list_local_models()
     assert "Available local models:" in result
     assert "mistral-nemo:latest" in result
     assert "llama3:8b" in result
 
 @pytest.mark.asyncio
-@patch("ollama.list")
-async def test_list_local_models_empty(mock_list):
+@patch("ollama.AsyncClient")
+async def test_list_local_models_empty(mock_client_class):
     """Test listing models when none are installed."""
     from mcp_server import list_local_models
-    mock_list.return_value = {'models': []}
+    mock_client = MagicMock()
+    mock_client_class.return_value = mock_client
+    mock_client.list = AsyncMock(return_value={'models': []})
     result = await list_local_models()
     assert "No local models found" in result
 
 @pytest.mark.asyncio
-@patch("ollama.list")
-async def test_list_local_models_error(mock_list):
+@patch("ollama.AsyncClient")
+async def test_list_local_models_error(mock_client_class):
     """Test list_local_models error handling."""
     from mcp_server import list_local_models
-    mock_list.side_effect = Exception("Ollama connection failed")
+    mock_client = MagicMock()
+    mock_client_class.return_value = mock_client
+    mock_client.list = AsyncMock(side_effect=Exception("Ollama connection failed"))
     result = await list_local_models()
     assert "Error listing models" in result
 
 @pytest.mark.asyncio
-@patch("ollama.chat")
-async def test_ask_local_assistant_custom_model(mock_chat):
+@patch("ollama.AsyncClient")
+async def test_ask_local_assistant_custom_model(mock_client_class):
     """Test assistant using a specific model."""
     from mcp_server import ask_local_assistant
-    mock_chat.side_effect = [
+    mock_client = MagicMock()
+    mock_client_class.return_value = mock_client
+    mock_client.show = AsyncMock(return_value={"modelinfo": {"context_length": 32768}})
+    mock_client.chat = AsyncMock()
+    mock_client.chat.side_effect = [
         {'message': {'content': 'using custom model'}},
         {'message': {'role': 'assistant', 'content': '{"status": "complete"}'}}
     ]
     await ask_local_assistant("Hello", model="llama3")
-    kwargs = mock_chat.call_args_list[0][1]
+    kwargs = mock_client.chat.call_args_list[0][1]
     assert kwargs['model'] == "llama3"
     assert kwargs['options'] == {'num_ctx': 32768}

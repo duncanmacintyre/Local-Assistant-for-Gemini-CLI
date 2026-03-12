@@ -73,6 +73,7 @@ For complex tasks (e.g., "Refactor the entire module" or "Investigate this bug a
 *   **Model Discovery:** Automatically detects your local model's native context limit and optimizes reasoning accordingly.
 *   **Interactive Clarification:** If a task is ambiguous, the assistant can pause and ask the user for missing information via Gemini.
 *   **PDF Support:** Native PDF reading and page-by-page extraction.
+*   **Resource Management & Cancellation:** Fully asynchronous execution allows for immediate interruption of local model inference and shell commands when a task is cancelled in Gemini CLI (Esc), ensuring no orphaned processes or GPU/CPU leakage.
 
 ## 🏗️ Architecture
 
@@ -113,6 +114,14 @@ This section outlines upcoming features planned for the Local Assistant, priorit
 ### 6. Safe Mode (Read-Only)
 *   **Problem:** Even with sandboxing, a powerful agent might accidentally overwrite a file or run a destructive command during complex investigations.
 *   **Action:** Expose a dedicated `ask_local_assistant_readonly` tool. This version will strictly lack `write_file` and `run_shell_command` capabilities, allowing users to perform "pure" analysis and summarization with zero risk of side effects.
+
+### 7. Subagent Integration
+*   **Problem:** The assistant is currently implemented as a standard MCP tool, which doesn't leverage Gemini CLI's native "Subagent" architecture for cleaner delegation and domain-specific personas.
+*   **Action:** Refactor the assistant into a formal Subagent. This involves creating an agent definition (`.gemini/agents/local-assistant.md`) that encapsulates the planning and execution logic, making delegation more seamless and idiomatic.
+
+### 8. Asynchronous / Parallel Execution
+*   **Problem:** The "Cloud Brain" (Gemini) currently waits for the "Local Hands" to finish before continuing, preventing simultaneous work (e.g., Gemini researching while the local agent refactors).
+*   **Action:** Explore an asynchronous worker model. This would likely involve a standalone CLI script that Gemini can start as a background process, with a mechanism (like log polling or a status tool) to monitor progress and collect results without blocking the main conversation.
 
 ## 🔧 Troubleshooting
 
