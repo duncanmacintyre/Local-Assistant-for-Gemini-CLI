@@ -1,6 +1,6 @@
 # Lightweight Local Assistant
 
-**A powerful Python library for local AI automation, with an optional Gemini CLI extension.**
+**A powerful Python library for local AI automation, with an optional tool for the Gemini CLI.**
 
 Now, anywhere you build with Python, you can drop in an autonomous local assistant agent. 
 
@@ -10,9 +10,7 @@ The `lightweight_local_assistant` is an asynchronous Python framework that provi
 *   **Automated Refactoring:** Write a Python script that points the assistant at a directory and asks it to update outdated API calls across all files.
 *   **Data Extraction:** Create a script that uses the assistant to read through hundreds of local PDFs and compile a summary report.
 *   **Local RAG Pipelines:** Use the assistant as the intelligent "worker" node in your custom local data processing pipelines.
-*   **Interactive CLI:** Use the provided MCP extension to bring local context into the cloud-based Gemini CLI.
-
-Privacy is never guaranteed. If you use the optional Gemini CLI extension or send the local assistant's output to an external API, sensitive data could be sent to the cloud.
+*   **Interactive CLI:** Add the local assistant as a specialized **tool** within the cloud-based [Gemini CLI](https://github.com/google/gemini-cli).
 
 ---
 
@@ -194,9 +192,11 @@ async def utils_demo():
 
 ## 🎁 Bonus: Gemini CLI Extension
 
-If you use the [Gemini CLI](https://github.com/google/gemini-cli), you can use this library as a secure MCP extension. This creates a "Cloud Brain, Local Hands" architecture where Gemini orchestrates high-level goals and delegates local file operations to your machine.
+If you use the [Gemini CLI](https://github.com/google/gemini-cli), you can use this library as a secure MCP extension. The local assistant is then available to Gemini CLI as a tool (a capability that the cloud-based AI can choose to invoke). The cloud model orchestrates high-level goals and delegates specific, local operations to your machine's local LLM. 
 
-**⚠️ macOS Only:** The Gemini CLI extension is strictly limited to macOS. This is because it relies on the macOS `seatbelt` sandboxing mechanism (via Gemini's `-s` flag) to ensure the local agent cannot access files outside of the current working directory. The extension will refuse to start on other operating systems or if sandboxing is bypassed.
+Privacy is never guaranteed. The local assistant will process your private files locally on your machine, but it will then send the results (summaries, code snippets, etc.) to the cloud-based Gemini model. These responses could contain sensitive information.
+
+**⚠️ macOS Only:** The Gemini CLI extension is strictly limited to macOS. This is because it relies on the macOS `seatbelt` sandboxing mechanism (via Gemini's `-s` flag) to ensure the local agent cannot access files outside of the current working directory. The extension will refuse to start without this sandboxing.
 
 ### Installing the Extension
 Run the provided installer script. It will set up an isolated virtual environment and register the tool with Gemini CLI.
@@ -205,7 +205,7 @@ Run the provided installer script. It will set up an isolated virtual environmen
 ```
 
 ### Using the Extension
-**CRITICAL:** You must use the `-s` (sandbox) flag when starting Gemini CLI. The extension will refuse to run without macOS sandboxing enabled.
+You must use the `-s` (sandbox) flag when starting Gemini CLI. The extension will refuse to run without macOS sandboxing enabled.
 ```bash
 gemini -s "Use the local assistant to summarize 'contract_draft.pdf' and save it to 'summary.md'"
 ```
