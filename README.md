@@ -7,10 +7,11 @@ Now, anywhere you build with Python, you can drop in an autonomous local assista
 The `lightweight_local_assistant` is an asynchronous Python framework that provides a "Think-Act-Observe" reasoning loop for local LLMs (via Ollama). It empowers your local models to iteratively interact with your file system, execute shell commands, and read documents to accomplish complex tasks. 
 
 **Use Cases:**
-*   **Automated Refactoring:** Write a Python script that points the assistant at a directory and asks it to update outdated API calls across all files.
-*   **Data Extraction:** Create a script that uses the assistant to read through hundreds of local PDFs and compile a summary report.
-*   **Local RAG Pipelines:** Use the assistant as the intelligent "worker" node in your custom local data processing pipelines.
-*   **Interactive CLI:** Add the local assistant as a specialized **tool** within the cloud-based [Gemini CLI](https://github.com/google/gemini-cli).
+*   **CLI Tools:** Ask the local agent to run commands within your Python script.
+*   **Software:** Generate code.
+*   **Document Synthesis:** Read through hundreds of local PDFs and compile a summary report.
+*   **Data Processing:** Use the assistant as the intelligent worker node in your custom local data processing pipelines.
+*   **Gemini CLI Extension:** Add the local assistant as a tool within the cloud-based [Gemini CLI](https://github.com/google/gemini-cli).
 
 ---
 
